@@ -53,7 +53,7 @@
     "node-ssh": "^13.2.1"
   },
   "repository": {
-    "type": "self",
-    "url": "nope"
+    "type": "git",
+    "url": "https://github.com/AlonPeleg/iris-terminal"
   }
 }
