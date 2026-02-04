@@ -1,0 +1,59 @@
+{
+  "name": "iris-terminal",
+  "displayName": "iris-terminal",
+  "description": "a terminal bridge for intersystems",
+  "publisher": "alonpe",
+  "version": "0.0.3",
+  "engines": {
+    "vscode": "^1.108.1"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "iris-terminal.open",
+        "title": "IRIS: Open Terminal",
+        "icon": "$(terminal)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "iris-terminal.open",
+          "when": "view == workbench.explorer.fileView",
+          "group": "navigation"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "iris-terminal.open",
+          "group": "navigation"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.10",
+    "@types/node": "22.x",
+    "@types/ssh2": "^1.15.5",
+    "@types/vscode": "^1.108.1",
+    "@vscode/test-electron": "^2.5.2",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "node-ssh": "^13.2.1"
+  },
+  "repository": {
+    "type": "self",
+    "url": "nope"
+  }
+}
