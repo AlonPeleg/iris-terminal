@@ -6,15 +6,20 @@ let viewerPanel: vscode.WebviewPanel | undefined;
 
 export function activate(context: vscode.ExtensionContext) {
 
-    // --- AUTO-PIN LISTENER (Double-tap logic) ---
+    // --- ENHANCED AUTO-PIN LISTENER ---
     const pinListener = vscode.window.onDidChangeActiveTextEditor(async (editor) => {
         if (editor && editor.document.uri.scheme === 'isfs') {
+            // Strike 1: Immediate
             await vscode.commands.executeCommand('workbench.action.keepEditor');
-            setTimeout(async () => {
-                if (vscode.window.activeTextEditor === editor) {
-                    await vscode.commands.executeCommand('workbench.action.keepEditor');
-                }
-            }, 150);
+            
+            // Strike 2 & 3: After server handshake/refresh
+            [200, 500].forEach(delay => {
+                setTimeout(async () => {
+                    if (vscode.window.activeTextEditor === editor) {
+                        await vscode.commands.executeCommand('workbench.action.keepEditor');
+                    }
+                }, delay);
+            });
         }
     });
 
@@ -124,6 +129,14 @@ function showInWebview(server: string, global: string, pieces: string[], time: s
                 retainContextWhenHidden: true 
             }
         );
+        
+        // Handle messages from the webview (The Keep Open button)
+        viewerPanel.webview.onDidReceiveMessage(message => {
+            if (message.command === 'pinTab') {
+                vscode.commands.executeCommand('workbench.action.keepEditor');
+            }
+        });
+
         viewerPanel.onDidDispose(() => { viewerPanel = undefined; });
         viewerPanel.webview.html = getWebviewContent();
     }
@@ -146,7 +159,11 @@ function getWebviewContent() {
         <style>
             body { font-family: var(--vscode-editor-font-family); color: var(--vscode-editor-foreground); background: var(--vscode-editor-background); padding: 15px; }
             .toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; border-bottom: 1px solid var(--vscode-panel-border); padding-bottom: 10px; }
-            .btn-clear { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); border: none; padding: 4px 10px; cursor: pointer; border-radius: 2px; }
+            .toolbar-actions { display: flex; gap: 8px; }
+            .btn { border: none; padding: 4px 10px; cursor: pointer; border-radius: 2px; font-size: 12px; }
+            .btn-pin { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+            .btn-pin:hover { background: var(--vscode-button-hoverBackground); }
+            .btn-clear { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
             .btn-clear:hover { background: var(--vscode-button-secondaryHoverBackground); }
             .entry { border: 1px solid var(--vscode-panel-border); margin-bottom: 12px; border-radius: 4px; overflow: hidden; position: relative; }
             .header { background: var(--vscode-editor-lineHighlightBackground); padding: 10px; cursor: pointer; display: flex; align-items: center; font-size: 13px; }
@@ -166,16 +183,26 @@ function getWebviewContent() {
     <body>
         <div class="toolbar">
             <h3 style="margin:0">Global Viewer</h3>
-            <button class="btn-clear" onclick="clearAll()">Clear All</button>
+            <div class="toolbar-actions">
+                <button class="btn btn-pin" onclick="pinTab()">Keep Open</button>
+                <button class="btn btn-clear" onclick="clearAll()">Clear All</button>
+            </div>
         </div>
         <div id="container"></div>
         <script>
             const vscode = acquireVsCodeApi();
+            
+            function pinTab() {
+                vscode.postMessage({ command: 'pinTab' });
+            }
+
             function clearAll() { document.getElementById('container').innerHTML = ''; }
+            
             function deleteEntry(btn, event) { 
-                event.stopPropagation(); // Prevents collapsing when clicking X
+                event.stopPropagation();
                 btn.closest('.entry').remove(); 
             }
+
             function toggleEntry(headerElement) {
                 const entry = headerElement.parentElement;
                 const content = headerElement.nextElementSibling;
