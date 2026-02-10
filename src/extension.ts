@@ -2,12 +2,9 @@ import * as vscode from 'vscode';
 import * as net from 'net';
 import * as tls from 'tls';
 
-// Variable to store the dedicated output channel
-let globalInspector: vscode.OutputChannel | undefined;
+let viewerPanel: vscode.WebviewPanel | undefined;
 
 export function activate(context: vscode.ExtensionContext) {
-    // 1. Create the dedicated Tab (Output Channel)
-    globalInspector = vscode.window.createOutputChannel("Global Inspector");
 
     let disposable = vscode.commands.registerCommand('iris-terminal.open', async (uri?: vscode.Uri) => {
         const config = vscode.workspace.getConfiguration();
@@ -47,7 +44,6 @@ export function activate(context: vscode.ExtensionContext) {
 
         const chosenId = selection.detail; 
         const entry = serverList[chosenId];
-        // Capture the display name to show in the Inspector header
         const serverLabel = selection.label.replace('$(star-full) ', '').replace('$(server) ', '');
 
         const host = entry?.webServer?.host || entry?.host || '';
@@ -73,54 +69,165 @@ export function activate(context: vscode.ExtensionContext) {
         openTerminal(finalHost, user, pass, chosenId, serverLabel, detectedNamespace, chosenEncoding);
     });
 
-    // 2. NEW FEATURE: Universal Global Decoder (Ctrl+Click)
+    // --- GLOBAL VIEWER LINK PROVIDER ---
     let linkProvider = vscode.window.registerTerminalLinkProvider({
         provideTerminalLinks: (context: vscode.TerminalLinkContext) => {
             const line = context.line.trim();
-            // Match any line that looks like a global output
-            if (line.startsWith('^') || line.includes('=^')) {
+            // Activates on any line that looks like a global printout
+            if (line.startsWith('^') || line.includes('=^') || (line.includes('^') && line.includes('='))) {
                 return [{
                     startIndex: 0,
                     length: context.line.length,
-                    tooltip: 'Ctrl+Click to Decode in Global Inspector Tab',
+                    tooltip: 'Ctrl+Click to view in Global Viewer (Tree Mode)',
                     data: context.line
                 }];
             }
             return [];
         },
         handleTerminalLink: (link: any) => {
-            if (!globalInspector) return;
-
             const rawLine: string = link.data.trim();
             const time = new Date().toLocaleTimeString();
-            
-            // Parse Global name and Value
+            // Use the active terminal name to identify the server/namespace context
+            const terminalName = vscode.window.activeTerminal?.name || "IRIS Server";
+
             let globalName = rawLine.includes('=') ? rawLine.split('=')[0].trim() : "Global Reference";
             let valuePart = rawLine.includes('=') ? rawLine.split('=')[1].trim() : rawLine;
             
-            // Clean quotes and split by delimiter
+            // Standardizing the value: remove quotes and split by asterisk
             valuePart = valuePart.replace(/^"|"$/g, '');
             const pieces = valuePart.split('*');
-            
-            // Get the Terminal name (which contains the server/namespace)
-            const terminalName = vscode.window.activeTerminal?.name || "IRIS Server";
 
-            // Output to the separate Tab
-            globalInspector.show(true); // Bring tab to front
-            globalInspector.appendLine(`[${time}] SERVER: ${terminalName}`);
-            globalInspector.appendLine(`INSPECTING: ${globalName}`);
-            globalInspector.appendLine(`--------------------------------------------------`);
-            
-            pieces.forEach((val: string, index: number) => {
-                const num = (index + 1).toString().padEnd(4);
-                globalInspector?.appendLine(`${num}: ${val}`);
-            });
-            
-            globalInspector.appendLine(`--------------------------------------------------\n`);
+            showInWebview(terminalName, globalName, pieces, time);
         }
     });
 
     context.subscriptions.push(disposable, linkProvider);
+}
+
+function showInWebview(server: string, global: string, pieces: string[], time: string) {
+    if (!viewerPanel) {
+        viewerPanel = vscode.window.createWebviewPanel(
+            'globalViewer',
+            'Global Viewer',
+            vscode.ViewColumn.Two, // Opens in a new split tab to the right
+            { 
+                enableScripts: true,
+                retainContextWhenHidden: true // Keeps the data if you switch tabs
+            }
+        );
+        viewerPanel.onDidDispose(() => { viewerPanel = undefined; });
+        viewerPanel.webview.html = getWebviewContent();
+    }
+
+    // Pass data to the HTML/JavaScript inside the Webview
+    viewerPanel.webview.postMessage({
+        server,
+        global,
+        pieces,
+        time
+    });
+    viewerPanel.reveal(vscode.ViewColumn.Two);
+}
+
+function getWebviewContent() {
+    return `<!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <style>
+            body { 
+                font-family: var(--vscode-editor-font-family); 
+                color: var(--vscode-editor-foreground); 
+                background: var(--vscode-editor-background); 
+                padding: 15px; 
+            }
+            .entry { 
+                border: 1px solid var(--vscode-panel-border); 
+                margin-bottom: 12px; 
+                border-radius: 4px; 
+                overflow: hidden; 
+            }
+            .header { 
+                background: var(--vscode-editor-lineHighlightBackground); 
+                padding: 10px; 
+                cursor: pointer; 
+                display: flex; 
+                justify-content: space-between; 
+                align-items: center;
+                font-size: 13px;
+            }
+            .header:hover { 
+                background: var(--vscode-list-hoverBackground); 
+            }
+            .content { 
+                padding: 10px; 
+                display: block; 
+                border-top: 1px solid var(--vscode-panel-border); 
+                background: var(--vscode-editor-background); 
+            }
+            .hidden { display: none; }
+            .piece { 
+                display: flex; 
+                gap: 15px;
+                border-bottom: 1px solid #80808033; 
+                padding: 4px 5px; 
+                font-family: var(--vscode-editor-font-family);
+                font-size: 12px;
+            }
+            .piece:last-child { border-bottom: none; }
+            .num { 
+                color: var(--vscode-symbolIcon-numberForeground); 
+                font-weight: bold; 
+                min-width: 25px;
+                text-align: right;
+            }
+            .arrow { 
+                display: inline-block;
+                width: 10px;
+                transition: transform 0.1s; 
+                margin-right: 5px;
+            }
+            .entry.collapsed .arrow { transform: rotate(-90deg); }
+            .server-info { font-weight: bold; color: var(--vscode-textLink-foreground); }
+        </style>
+    </head>
+    <body>
+        <h3 style="margin-top:0">Decoded Globals</h3>
+        <div id="container"></div>
+        <script>
+            const vscode = acquireVsCodeApi();
+            window.addEventListener('message', event => {
+                const { server, global, pieces, time } = event.data;
+                const container = document.getElementById('container');
+                
+                const entry = document.createElement('div');
+                entry.className = 'entry';
+                
+                const pieceHtml = pieces.map((p, i) => \`
+                    <div class="piece">
+                        <span class="num">\${i+1}</span> 
+                        <span>\${p === "" ? "<span style='opacity:0.3'>[empty]</span>" : p}</span>
+                    </div>\`).join('');
+                
+                entry.innerHTML = \`
+                    <div class="header" onclick="toggleEntry(this)">
+                        <span><span class="arrow">▼</span> <span class="server-info">\${server}</span> » <b>\${global}</b></span>
+                        <span style="font-size: 11px; opacity: 0.6;">\${time}</span>
+                    </div>
+                    <div class="content">\${pieceHtml}</div>
+                \`;
+                container.prepend(entry); // Newest lookups appear at the top
+            });
+
+            function toggleEntry(headerElement) {
+                const entry = headerElement.parentElement;
+                const content = headerElement.nextElementSibling;
+                entry.classList.toggle('collapsed');
+                content.classList.toggle('hidden');
+            }
+        </script>
+    </body>
+    </html>`;
 }
 
 function openTerminal(host: string, user: string, pass: string, serverId: string, serverDisplayName: string, initialNamespace: string, encoding: string) {
@@ -131,7 +238,6 @@ function openTerminal(host: string, user: string, pass: string, serverId: string
     let lastKnownNS = initialNamespace.toUpperCase();
     let isConnected = false;
 
-    // Helper for terminal naming
     const getTerminalTitle = (ns: string) => `IRIS: ${serverDisplayName}${ns ? ' - ' + ns : ''}`;
 
     const decodeBuffer = (buf: Buffer): string => {
