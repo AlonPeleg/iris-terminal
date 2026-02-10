@@ -6,6 +6,18 @@ let viewerPanel: vscode.WebviewPanel | undefined;
 
 export function activate(context: vscode.ExtensionContext) {
 
+    // --- AUTO-PIN LISTENER (Double-tap logic) ---
+    const pinListener = vscode.window.onDidChangeActiveTextEditor(async (editor) => {
+        if (editor && editor.document.uri.scheme === 'isfs') {
+            await vscode.commands.executeCommand('workbench.action.keepEditor');
+            setTimeout(async () => {
+                if (vscode.window.activeTextEditor === editor) {
+                    await vscode.commands.executeCommand('workbench.action.keepEditor');
+                }
+            }, 150);
+        }
+    });
+
     let disposable = vscode.commands.registerCommand('iris-terminal.open', async (uri?: vscode.Uri) => {
         const config = vscode.workspace.getConfiguration();
         const serverList: any = config.get('intersystems.servers') || config.get('interSystems.servers') || {};
@@ -73,12 +85,11 @@ export function activate(context: vscode.ExtensionContext) {
     let linkProvider = vscode.window.registerTerminalLinkProvider({
         provideTerminalLinks: (context: vscode.TerminalLinkContext) => {
             const line = context.line.trim();
-            // Activates on any line that looks like a global printout
             if (line.startsWith('^') || line.includes('=^') || (line.includes('^') && line.includes('='))) {
                 return [{
                     startIndex: 0,
                     length: context.line.length,
-                    tooltip: 'Ctrl+Click to view in Global Viewer (Tree Mode)',
+                    tooltip: 'Ctrl+Click to view in Global Viewer',
                     data: context.line
                 }];
             }
@@ -87,13 +98,11 @@ export function activate(context: vscode.ExtensionContext) {
         handleTerminalLink: (link: any) => {
             const rawLine: string = link.data.trim();
             const time = new Date().toLocaleTimeString();
-            // Use the active terminal name to identify the server/namespace context
             const terminalName = vscode.window.activeTerminal?.name || "IRIS Server";
 
             let globalName = rawLine.includes('=') ? rawLine.split('=')[0].trim() : "Global Reference";
             let valuePart = rawLine.includes('=') ? rawLine.split('=')[1].trim() : rawLine;
             
-            // Standardizing the value: remove quotes and split by asterisk
             valuePart = valuePart.replace(/^"|"$/g, '');
             const pieces = valuePart.split('*');
 
@@ -101,7 +110,7 @@ export function activate(context: vscode.ExtensionContext) {
         }
     });
 
-    context.subscriptions.push(disposable, linkProvider);
+    context.subscriptions.push(disposable, linkProvider, pinListener);
 }
 
 function showInWebview(server: string, global: string, pieces: string[], time: string) {
@@ -109,24 +118,24 @@ function showInWebview(server: string, global: string, pieces: string[], time: s
         viewerPanel = vscode.window.createWebviewPanel(
             'globalViewer',
             'Global Viewer',
-            vscode.ViewColumn.Two, // Opens in a new split tab to the right
+            vscode.ViewColumn.Two, 
             { 
                 enableScripts: true,
-                retainContextWhenHidden: true // Keeps the data if you switch tabs
+                retainContextWhenHidden: true 
             }
         );
         viewerPanel.onDidDispose(() => { viewerPanel = undefined; });
         viewerPanel.webview.html = getWebviewContent();
     }
 
-    // Pass data to the HTML/JavaScript inside the Webview
     viewerPanel.webview.postMessage({
+        command: 'addEntry',
         server,
         global,
         pieces,
         time
     });
-    viewerPanel.reveal(vscode.ViewColumn.Two);
+    viewerPanel.reveal(vscode.ViewColumn.Two, true);
 }
 
 function getWebviewContent() {
@@ -135,96 +144,72 @@ function getWebviewContent() {
     <head>
         <meta charset="UTF-8">
         <style>
-            body { 
-                font-family: var(--vscode-editor-font-family); 
-                color: var(--vscode-editor-foreground); 
-                background: var(--vscode-editor-background); 
-                padding: 15px; 
-            }
-            .entry { 
-                border: 1px solid var(--vscode-panel-border); 
-                margin-bottom: 12px; 
-                border-radius: 4px; 
-                overflow: hidden; 
-            }
-            .header { 
-                background: var(--vscode-editor-lineHighlightBackground); 
-                padding: 10px; 
-                cursor: pointer; 
-                display: flex; 
-                justify-content: space-between; 
-                align-items: center;
-                font-size: 13px;
-            }
-            .header:hover { 
-                background: var(--vscode-list-hoverBackground); 
-            }
-            .content { 
-                padding: 10px; 
-                display: block; 
-                border-top: 1px solid var(--vscode-panel-border); 
-                background: var(--vscode-editor-background); 
-            }
+            body { font-family: var(--vscode-editor-font-family); color: var(--vscode-editor-foreground); background: var(--vscode-editor-background); padding: 15px; }
+            .toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; border-bottom: 1px solid var(--vscode-panel-border); padding-bottom: 10px; }
+            .btn-clear { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); border: none; padding: 4px 10px; cursor: pointer; border-radius: 2px; }
+            .btn-clear:hover { background: var(--vscode-button-secondaryHoverBackground); }
+            .entry { border: 1px solid var(--vscode-panel-border); margin-bottom: 12px; border-radius: 4px; overflow: hidden; position: relative; }
+            .header { background: var(--vscode-editor-lineHighlightBackground); padding: 10px; cursor: pointer; display: flex; align-items: center; font-size: 13px; }
+            .header:hover { background: var(--vscode-list-hoverBackground); }
+            .header-text { flex-grow: 1; display: flex; justify-content: space-between; align-items: center; margin-right: 10px; }
+            .btn-delete { color: var(--vscode-errorForeground); cursor: pointer; font-weight: bold; padding: 5px 10px; font-size: 16px; border-radius: 4px; line-height: 1; }
+            .btn-delete:hover { background: var(--vscode-toolbar-hoverBackground); }
+            .content { padding: 10px; display: block; border-top: 1px solid var(--vscode-panel-border); background: var(--vscode-editor-background); }
             .hidden { display: none; }
-            .piece { 
-                display: flex; 
-                gap: 15px;
-                border-bottom: 1px solid #80808033; 
-                padding: 4px 5px; 
-                font-family: var(--vscode-editor-font-family);
-                font-size: 12px;
-            }
-            .piece:last-child { border-bottom: none; }
-            .num { 
-                color: var(--vscode-symbolIcon-numberForeground); 
-                font-weight: bold; 
-                min-width: 25px;
-                text-align: right;
-            }
-            .arrow { 
-                display: inline-block;
-                width: 10px;
-                transition: transform 0.1s; 
-                margin-right: 5px;
-            }
+            .piece { display: flex; gap: 15px; border-bottom: 1px solid #80808033; padding: 4px 5px; font-size: 12px; }
+            .num { color: var(--vscode-symbolIcon-numberForeground); font-weight: bold; min-width: 25px; text-align: right; }
+            .arrow { display: inline-block; width: 10px; transition: transform 0.1s; margin-right: 8px; }
             .entry.collapsed .arrow { transform: rotate(-90deg); }
             .server-info { font-weight: bold; color: var(--vscode-textLink-foreground); }
         </style>
     </head>
     <body>
-        <h3 style="margin-top:0">Decoded Globals</h3>
+        <div class="toolbar">
+            <h3 style="margin:0">Global Viewer</h3>
+            <button class="btn-clear" onclick="clearAll()">Clear All</button>
+        </div>
         <div id="container"></div>
         <script>
             const vscode = acquireVsCodeApi();
-            window.addEventListener('message', event => {
-                const { server, global, pieces, time } = event.data;
-                const container = document.getElementById('container');
-                
-                const entry = document.createElement('div');
-                entry.className = 'entry';
-                
-                const pieceHtml = pieces.map((p, i) => \`
-                    <div class="piece">
-                        <span class="num">\${i+1}</span> 
-                        <span>\${p === "" ? "<span style='opacity:0.3'>[empty]</span>" : p}</span>
-                    </div>\`).join('');
-                
-                entry.innerHTML = \`
-                    <div class="header" onclick="toggleEntry(this)">
-                        <span><span class="arrow">▼</span> <span class="server-info">\${server}</span> » <b>\${global}</b></span>
-                        <span style="font-size: 11px; opacity: 0.6;">\${time}</span>
-                    </div>
-                    <div class="content">\${pieceHtml}</div>
-                \`;
-                container.prepend(entry); // Newest lookups appear at the top
-            });
-
+            function clearAll() { document.getElementById('container').innerHTML = ''; }
+            function deleteEntry(btn, event) { 
+                event.stopPropagation(); // Prevents collapsing when clicking X
+                btn.closest('.entry').remove(); 
+            }
             function toggleEntry(headerElement) {
                 const entry = headerElement.parentElement;
                 const content = headerElement.nextElementSibling;
                 entry.classList.toggle('collapsed');
                 content.classList.toggle('hidden');
             }
+
+            window.addEventListener('message', event => {
+                const message = event.data;
+                if (message.command === 'addEntry') {
+                    const { server, global, pieces, time } = message;
+                    const container = document.getElementById('container');
+                    const entry = document.createElement('div');
+                    entry.className = 'entry';
+                    const pieceHtml = pieces.map((p, i) => \`
+                        <div class="piece">
+                            <span class="num">\${i+1}</span> 
+                            <span>\${p === "" ? "<span style='opacity:0.3'>[empty]</span>" : p}</span>
+                        </div>\`).join('');
+                    
+                    entry.innerHTML = \`
+                        <div class="header" onclick="toggleEntry(this)">
+                            <span class="arrow">▼</span>
+                            <div class="header-text">
+                                <span><span class="server-info">\${server}</span> » <b>\${global}</b></span>
+                                <span style="font-size: 11px; opacity: 0.6;">\${time}</span>
+                            </div>
+                            <div class="btn-delete" title="Delete entry" onclick="deleteEntry(this, event)">×</div>
+                        </div>
+                        <div class="content">\${pieceHtml}</div>
+                    \`;
+                    container.prepend(entry);
+                }
+            });
         </script>
     </body>
     </html>`;
@@ -248,9 +233,7 @@ function openTerminal(host: string, user: string, pass: string, serverId: string
             if ((byte >= 0x80 && byte <= 0x9A) || (byte >= 0xE0 && byte <= 0xFA)) {
                 const base = byte >= 0xE0 ? 0xE0 : 0x80;
                 result += String.fromCharCode(byte - base + 0x05D0);
-            } else {
-                result += String.fromCharCode(byte);
-            }
+            } else { result += String.fromCharCode(byte); }
         }
         return result;
     };
@@ -260,11 +243,8 @@ function openTerminal(host: string, user: string, pass: string, serverId: string
         const buf = Buffer.alloc(str.length);
         for (let i = 0; i < str.length; i++) {
             const code = str.charCodeAt(i);
-            if (code >= 0x05D0 && code <= 0x05EA) {
-                buf[i] = code - 0x05D0 + 0x80;
-            } else {
-                buf[i] = code & 0xFF;
-            }
+            if (code >= 0x05D0 && code <= 0x05EA) { buf[i] = code - 0x05D0 + 0x80; } 
+            else { buf[i] = code & 0xFF; }
         }
         return buf;
     };
@@ -274,16 +254,11 @@ function openTerminal(host: string, user: string, pass: string, serverId: string
         open: () => {
             const port = 23;
             const connect = (trySSL: boolean) => {
-                if (trySSL) {
-                    client = tls.connect({ host, port, rejectUnauthorized: false, timeout: 1500 });
-                } else {
-                    client = net.createConnection(port, host);
-                }
+                if (trySSL) { client = tls.connect({ host, port, rejectUnauthorized: false, timeout: 1500 }); } 
+                else { client = net.createConnection(port, host); }
 
                 client.on('data', (data: Buffer) => {
-                    if (!isConnected && trySSL) {
-                        writeEmitter.fire(`\x1b[32m[Encrypted SSL Connection]\x1b[0m\r\n`);
-                    }
+                    if (!isConnected && trySSL) { writeEmitter.fire(`\x1b[32m[Encrypted SSL Connection]\x1b[0m\r\n`); }
                     isConnected = true;
                     const str = decodeBuffer(data);
                     writeEmitter.fire(str.replace(/\n/g, '\r\n'));
@@ -293,9 +268,7 @@ function openTerminal(host: string, user: string, pass: string, serverId: string
                         const currentNS = promptMatch[1].toUpperCase();
                         if (currentNS !== lastKnownNS) {
                             lastKnownNS = currentNS;
-                            vscode.commands.executeCommand('workbench.action.terminal.renameWithArg', {
-                                name: getTerminalTitle(currentNS)
-                            });
+                            vscode.commands.executeCommand('workbench.action.terminal.renameWithArg', { name: getTerminalTitle(currentNS) });
                         }
                     }
 
@@ -317,13 +290,9 @@ function openTerminal(host: string, user: string, pass: string, serverId: string
                 client.on('error', (err: any) => {
                     const errMsg = err.message || "";
                     if (trySSL && !isConnected && (errMsg.includes('WRONG_VERSION_NUMBER') || err.code === 'ECONNRESET' || err.code === 'ETIMEDOUT')) {
-                        client.destroy();
-                        connect(false); 
-                    } else {
-                        writeEmitter.fire(`\r\n\x1b[31m[ERROR]: ${errMsg}\x1b[0m\r\n`);
-                    }
+                        client.destroy(); connect(false); 
+                    } else { writeEmitter.fire(`\r\n\x1b[31m[ERROR]: \${errMsg}\x1b[0m\r\n`); }
                 });
-
                 client.on('timeout', () => { if (trySSL && !isConnected) { client.destroy(); connect(false); } });
                 client.on('close', () => { if (isConnected) writeEmitter.fire('\r\n\x1b[33m--- Disconnected ---\x1b[0m\r\n'); });
             };
@@ -338,10 +307,7 @@ function openTerminal(host: string, user: string, pass: string, serverId: string
         }
     };
 
-    terminal = vscode.window.createTerminal({ 
-        name: getTerminalTitle(initialNamespace), 
-        pty 
-    });
+    terminal = vscode.window.createTerminal({ name: getTerminalTitle(initialNamespace), pty });
     terminal.show();
 }
 // npm run compile - to compile the extension
