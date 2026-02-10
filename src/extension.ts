@@ -2,9 +2,14 @@ import * as vscode from 'vscode';
 import * as net from 'net';
 import * as tls from 'tls';
 
+// Variable to store the dedicated output channel
+let globalInspector: vscode.OutputChannel | undefined;
+
 export function activate(context: vscode.ExtensionContext) {
+    // 1. Create the dedicated Tab (Output Channel)
+    globalInspector = vscode.window.createOutputChannel("Global Inspector");
+
     let disposable = vscode.commands.registerCommand('iris-terminal.open', async (uri?: vscode.Uri) => {
-        
         const config = vscode.workspace.getConfiguration();
         const serverList: any = config.get('intersystems.servers') || config.get('interSystems.servers') || {};
         
@@ -42,6 +47,9 @@ export function activate(context: vscode.ExtensionContext) {
 
         const chosenId = selection.detail; 
         const entry = serverList[chosenId];
+        // Capture the display name to show in the Inspector header
+        const serverLabel = selection.label.replace('$(star-full) ', '').replace('$(server) ', '');
+
         const host = entry?.webServer?.host || entry?.host || '';
         const user = entry?.username || '';
         const pass = entry?.password || '';
@@ -62,19 +70,69 @@ export function activate(context: vscode.ExtensionContext) {
 
         if (!finalHost) return;
 
-        openTerminal(finalHost, user, pass, chosenId, detectedNamespace, chosenEncoding);
+        openTerminal(finalHost, user, pass, chosenId, serverLabel, detectedNamespace, chosenEncoding);
     });
 
-    context.subscriptions.push(disposable);
+    // 2. NEW FEATURE: Universal Global Decoder (Ctrl+Click)
+    let linkProvider = vscode.window.registerTerminalLinkProvider({
+        provideTerminalLinks: (context: vscode.TerminalLinkContext) => {
+            const line = context.line.trim();
+            // Match any line that looks like a global output
+            if (line.startsWith('^') || line.includes('=^')) {
+                return [{
+                    startIndex: 0,
+                    length: context.line.length,
+                    tooltip: 'Ctrl+Click to Decode in Global Inspector Tab',
+                    data: context.line
+                }];
+            }
+            return [];
+        },
+        handleTerminalLink: (link: any) => {
+            if (!globalInspector) return;
+
+            const rawLine: string = link.data.trim();
+            const time = new Date().toLocaleTimeString();
+            
+            // Parse Global name and Value
+            let globalName = rawLine.includes('=') ? rawLine.split('=')[0].trim() : "Global Reference";
+            let valuePart = rawLine.includes('=') ? rawLine.split('=')[1].trim() : rawLine;
+            
+            // Clean quotes and split by delimiter
+            valuePart = valuePart.replace(/^"|"$/g, '');
+            const pieces = valuePart.split('*');
+            
+            // Get the Terminal name (which contains the server/namespace)
+            const terminalName = vscode.window.activeTerminal?.name || "IRIS Server";
+
+            // Output to the separate Tab
+            globalInspector.show(true); // Bring tab to front
+            globalInspector.appendLine(`[${time}] SERVER: ${terminalName}`);
+            globalInspector.appendLine(`INSPECTING: ${globalName}`);
+            globalInspector.appendLine(`--------------------------------------------------`);
+            
+            pieces.forEach((val: string, index: number) => {
+                const num = (index + 1).toString().padEnd(4);
+                globalInspector?.appendLine(`${num}: ${val}`);
+            });
+            
+            globalInspector.appendLine(`--------------------------------------------------\n`);
+        }
+    });
+
+    context.subscriptions.push(disposable, linkProvider);
 }
 
-function openTerminal(host: string, user: string, pass: string, serverName: string, initialNamespace: string, encoding: string) {
+function openTerminal(host: string, user: string, pass: string, serverId: string, serverDisplayName: string, initialNamespace: string, encoding: string) {
     const writeEmitter = new vscode.EventEmitter<string>();
     let client: any; 
     let userSent = false, passSent = false, nsSent = false;
     let terminal: vscode.Terminal | undefined;
     let lastKnownNS = initialNamespace.toUpperCase();
     let isConnected = false;
+
+    // Helper for terminal naming
+    const getTerminalTitle = (ns: string) => `IRIS: ${serverDisplayName}${ns ? ' - ' + ns : ''}`;
 
     const decodeBuffer = (buf: Buffer): string => {
         if (encoding !== 'windows1255') return buf.toString(encoding as BufferEncoding);
@@ -109,15 +167,9 @@ function openTerminal(host: string, user: string, pass: string, serverName: stri
         onDidWrite: writeEmitter.event,
         open: () => {
             const port = 23;
-
             const connect = (trySSL: boolean) => {
                 if (trySSL) {
-                    client = tls.connect({ 
-                        host, 
-                        port, 
-                        rejectUnauthorized: false,
-                        timeout: 1500 
-                    });
+                    client = tls.connect({ host, port, rejectUnauthorized: false, timeout: 1500 });
                 } else {
                     client = net.createConnection(port, host);
                 }
@@ -127,23 +179,20 @@ function openTerminal(host: string, user: string, pass: string, serverName: stri
                         writeEmitter.fire(`\x1b[32m[Encrypted SSL Connection]\x1b[0m\r\n`);
                     }
                     isConnected = true;
-                    
                     const str = decodeBuffer(data);
                     writeEmitter.fire(str.replace(/\n/g, '\r\n'));
 
-                    // Namespace tracking
                     const promptMatch = str.match(/([A-Z0-9%]+)>/i);
                     if (promptMatch && promptMatch[1] && terminal) {
                         const currentNS = promptMatch[1].toUpperCase();
                         if (currentNS !== lastKnownNS) {
                             lastKnownNS = currentNS;
                             vscode.commands.executeCommand('workbench.action.terminal.renameWithArg', {
-                                name: `IRIS: ${serverName} - ${currentNS}`
+                                name: getTerminalTitle(currentNS)
                             });
                         }
                     }
 
-                    // Auto-login
                     const lowerStr = str.toLowerCase();
                     if (user && !userSent && (lowerStr.includes('login:') || lowerStr.includes('username:'))) {
                         userSent = true;
@@ -161,12 +210,7 @@ function openTerminal(host: string, user: string, pass: string, serverName: stri
 
                 client.on('error', (err: any) => {
                     const errMsg = err.message || "";
-                    // Catch SSL mismatch and fallback to plain TCP
-                    if (trySSL && !isConnected && (
-                        errMsg.includes('WRONG_VERSION_NUMBER') || 
-                        err.code === 'ECONNRESET' || 
-                        err.code === 'ETIMEDOUT'
-                    )) {
+                    if (trySSL && !isConnected && (errMsg.includes('WRONG_VERSION_NUMBER') || err.code === 'ECONNRESET' || err.code === 'ETIMEDOUT')) {
                         client.destroy();
                         connect(false); 
                     } else {
@@ -174,18 +218,9 @@ function openTerminal(host: string, user: string, pass: string, serverName: stri
                     }
                 });
 
-                client.on('timeout', () => {
-                    if (trySSL && !isConnected) {
-                        client.destroy();
-                        connect(false);
-                    }
-                });
-
-                client.on('close', () => {
-                    if (isConnected) writeEmitter.fire('\r\n\x1b[33m--- Disconnected ---\x1b[0m\r\n');
-                });
+                client.on('timeout', () => { if (trySSL && !isConnected) { client.destroy(); connect(false); } });
+                client.on('close', () => { if (isConnected) writeEmitter.fire('\r\n\x1b[33m--- Disconnected ---\x1b[0m\r\n'); });
             };
-
             connect(true);
         },
         close: () => client?.destroy(),
@@ -198,7 +233,7 @@ function openTerminal(host: string, user: string, pass: string, serverName: stri
     };
 
     terminal = vscode.window.createTerminal({ 
-        name: `IRIS: ${serverName}${initialNamespace ? ' - ' + initialNamespace : ''}`, 
+        name: getTerminalTitle(initialNamespace), 
         pty 
     });
     terminal.show();
