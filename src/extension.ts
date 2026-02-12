@@ -247,30 +247,21 @@ function openTerminal(host: string, user: string, pass: string, serverId: string
     let client: any; 
     let userSent = false, passSent = false, nsSent = false;
     let isConnected = false;
+    
+    let terminal: vscode.Terminal | undefined;
+    let lastKnownNS = initialNamespace.toUpperCase();
+    const getTerminalTitle = (ns: string) => `IRIS: ${serverDisplayName}${ns ? ' - ' + ns : ''}`;
 
-    // We use the native decoder for performance, but keep logic explicit
     const decoder = new TextDecoder(encoding === 'windows1255' ? 'windows-1255' : 'utf-8');
 
-    // HEBREW TYPING FIX: This converts your keyboard input to the correct server bytes
     const encodeInput = (data: string): Buffer => {
         if (encoding !== 'windows1255') return Buffer.from(data, 'utf8');
-        
         const bytes: number[] = [];
         for (let i = 0; i < data.length; i++) {
             const charCode = data.charCodeAt(i);
-            
-            // Map Hebrew Unicode range to Windows-1255 bytes
-            if (charCode >= 0x05D0 && charCode <= 0x05EA) {
-                bytes.push(charCode - 0x05D0 + 0xE0);
-            } 
-            // Handle standard ASCII (Enter, Backspace, Letters, Numbers)
-            else if (charCode < 256) {
-                bytes.push(charCode);
-            }
-            // Fallback for unknown characters to prevent terminal hang
-            else {
-                bytes.push(0x3F); // Sends a '?' for unsupported chars
-            }
+            if (charCode >= 0x05D0 && charCode <= 0x05EA) bytes.push(charCode - 0x05D0 + 0xE0);
+            else if (charCode < 256) bytes.push(charCode);
+            else bytes.push(0x3F);
         }
         return Buffer.from(bytes);
     };
@@ -279,20 +270,29 @@ function openTerminal(host: string, user: string, pass: string, serverId: string
         onDidWrite: writeEmitter.event,
         open: () => {
             const connect = (trySSL: boolean) => {
-                // Connection logic remains identical to baseline
                 client = trySSL ? tls.connect({ host, port: 23, rejectUnauthorized: false, timeout: 1500 }) : net.createConnection(23, host);
                 
                 client.on('data', (data: Buffer) => {
-                    if (!isConnected && trySSL) {
-                        writeEmitter.fire('\x1b[32m[Encrypted SSL Connection]\x1b[0m\r\n');
-                    }
+                    if (!isConnected && trySSL) writeEmitter.fire('\x1b[32m[Encrypted SSL Connection]\x1b[0m\r\n');
                     isConnected = true;
                     
-                    // Native decoding (Faster than the baseline manual loop)
                     const str = decoder.decode(data);
                     writeEmitter.fire(str.replace(/\n/g, '\r\n'));
 
-                    // Auto-login logic (Baseline)
+                    // --- IMPROVED TRACKING REGEX ---
+                    // This matches patterns like USER> or NAMESPACE> only when they appear 
+                    // after a newline, avoiding <SYNTAX> or <UNDEFINED> errors.
+                    const promptMatch = str.match(/(?:\r\n|\n|^)([A-Z0-9%]+)>/i);
+                    if (promptMatch && promptMatch[1] && terminal) {
+                        const currentNS = promptMatch[1].toUpperCase();
+                        if (currentNS !== lastKnownNS) {
+                            lastKnownNS = currentNS;
+                            vscode.commands.executeCommand('workbench.action.terminal.renameWithArg', { 
+                                name: getTerminalTitle(currentNS) 
+                            });
+                        }
+                    }
+
                     const lowerStr = str.toLowerCase();
                     if (user && !userSent && (lowerStr.includes('login:') || lowerStr.includes('username:'))) {
                         userSent = true; 
@@ -309,27 +309,18 @@ function openTerminal(host: string, user: string, pass: string, serverId: string
                 });
 
                 client.on('error', (err: any) => {
-                    if (trySSL && !isConnected) {
-                        connect(false); 
-                    } else {
-                        writeEmitter.fire('\r\n\x1b[31mConnection Error: ' + err.message + '\x1b[0m\r\n');
-                    }
+                    if (trySSL && !isConnected) connect(false); 
+                    else writeEmitter.fire('\r\n\x1b[31mConnection Error: ' + err.message + '\x1b[0m\r\n');
                 });
             };
             connect(true);
         },
-        close: () => {
-            if (client) client.destroy();
-        },
-        // The fix: Input now passes through our encoder
-        handleInput: (data) => {
-            if (client) {
-                client.write(encodeInput(data));
-            }
-        }
+        close: () => { if (client) client.destroy(); },
+        handleInput: (data) => { if (client) client.write(encodeInput(data)); }
     };
 
-    vscode.window.createTerminal({ name: 'IRIS: ' + serverDisplayName, pty }).show();
+    terminal = vscode.window.createTerminal({ name: getTerminalTitle(initialNamespace), pty });
+    terminal.show();
 }
 // npm run compile - to compile the extension
 // vsce package --skip-license
