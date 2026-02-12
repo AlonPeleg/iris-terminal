@@ -316,7 +316,23 @@ function openTerminal(host: string, user: string, pass: string, serverId: string
             connect(true);
         },
         close: () => { if (client) client.destroy(); },
-        handleInput: (data) => { if (client) client.write(encodeInput(data)); }
+        handleInput: (data) => { 
+            if (client) {
+                // Intercept HOME (VT100 / Xterm)
+                if (data === '\x1b[H' || data === '\x1b[1~') {
+                    client.write('\x1b[1~'); // IRIS often prefers the ~ sequence
+                    return;
+                }
+                // Intercept END (VT100 / Xterm)
+                if (data === '\x1b[F' || data === '\x1b[4~') {
+                    client.write('\x1b[4~'); // IRIS often prefers the ~ sequence
+                    return;
+                }
+                
+                // Default: Encode and send
+                client.write(encodeInput(data)); 
+            }
+        }
     };
 
     terminal = vscode.window.createTerminal({ name: getTerminalTitle(initialNamespace), pty });
