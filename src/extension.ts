@@ -157,70 +157,86 @@ function getWebviewContent() {
     <head>
         <meta charset="UTF-8">
         <style>
-            body { font-family: var(--vscode-editor-font-family); color: var(--vscode-editor-foreground); background: var(--vscode-editor-background); padding: 15px; }
+            body { 
+                font-family: var(--vscode-editor-font-family); 
+                color: var(--vscode-editor-foreground); 
+                background: var(--vscode-editor-background); 
+                padding: 15px; 
+                margin: 0;
+            }
             
             .toolbar { 
                 display: flex; 
                 justify-content: space-between; 
                 align-items: center; 
-                margin-bottom: 15px; 
+                padding: 10px 15px;
                 border-bottom: 1px solid var(--vscode-panel-border); 
-                padding-bottom: 10px; 
                 position: sticky; 
                 top: 0; 
                 background: var(--vscode-editor-background); 
-                z-index: 10; 
+                z-index: 1000; 
+            }
+
+            .entry { 
+                border: 1px solid var(--vscode-panel-border); 
+                margin-bottom: 20px; 
+                border-radius: 4px; 
+                background: var(--vscode-editor-background);
+                display: flex;
+                flex-direction: column;
             }
             
-            .toolbar-actions { display: flex; gap: 4px; align-items: center; }
-            
-            .btn { 
-                border: none; 
-                padding: 4px; 
+            .header { 
+                /* Solid background is key to stop transparency */
+                background: var(--vscode-sideBar-background); 
+                padding: 10px 12px; 
                 cursor: pointer; 
-                border-radius: 3px; 
                 display: flex; 
                 align-items: center; 
-                justify-content: center;
-                background: transparent;
-                color: var(--vscode-foreground);
+                font-size: 13px;
+                position: sticky;
+                top: 42px; /* Sticks just below the main toolbar */
+                z-index: 100;
+                border-bottom: 1px solid var(--vscode-panel-border);
             }
-            .btn:hover { background: var(--vscode-toolbar-hoverBackground); }
-            
-            .btn-text { padding: 4px 10px; font-size: 12px; }
-            .btn-pin { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
-            .btn-pin:hover { background: var(--vscode-button-hoverBackground); }
-            
-            .btn svg { width: 16px; height: 16px; fill: currentColor; }
-
-            .btn-flip { 
-                background: var(--vscode-button-secondaryBackground); 
-                color: var(--vscode-button-secondaryForeground); 
-                border: 1px solid #80808066; 
-                margin-right: 10px;
-                padding: 2px 8px;
-            }
-            .btn-flip.active { background: #007acc; color: white; border-color: transparent; }
-
-            .entry { border: 1px solid var(--vscode-panel-border); margin-bottom: 12px; border-radius: 4px; overflow: hidden; position: relative; }
-            .header { background: var(--vscode-editor-lineHighlightBackground); padding: 8px 10px; cursor: pointer; display: flex; align-items: center; font-size: 13px; }
             .header:hover { background: var(--vscode-list-hoverBackground); }
+            
             .header-text { flex-grow: 1; display: flex; justify-content: space-between; align-items: center; margin-right: 10px; }
             
-            .btn-delete { color: var(--vscode-errorForeground); cursor: pointer; font-weight: bold; padding: 0 10px; font-size: 18px; opacity: 0.7; }
-            .btn-delete:hover { opacity: 1; }
+            /* Each Global is now its own scrollable box */
+            .content { 
+                max-height: 400px; 
+                overflow-y: auto; 
+                background: var(--vscode-editor-background);
+            }
 
-            .content { padding: 10px; display: block; border-top: 1px solid var(--vscode-panel-border); background: var(--vscode-editor-background); }
-            
             .entry.collapsed .content { display: none; }
+            .entry.collapsed .header { position: static; border-bottom: none; }
             .entry.collapsed .arrow { transform: rotate(-90deg); }
 
-            .piece { display: flex; gap: 15px; border-bottom: 1px solid #80808022; padding: 4px 5px; font-size: 12px; }
-            .num { color: var(--vscode-descriptionForeground); font-weight: bold; min-width: 20px; text-align: right; font-family: monospace; }
+            .piece { 
+                display: flex; 
+                gap: 15px; 
+                border-bottom: 1px solid var(--vscode-panel-border); 
+                padding: 8px 12px; 
+                font-size: 12px; 
+            }
+            .piece:last-child { border-bottom: none; }
+            
+            .num { color: var(--vscode-descriptionForeground); font-weight: bold; min-width: 25px; text-align: right; font-family: monospace; opacity: 0.6; }
+            .piece-val { white-space: pre-wrap; word-break: break-all; }
             .arrow { display: inline-block; width: 10px; transition: transform 0.1s; margin-right: 8px; font-size: 10px; }
             .server-info { font-weight: bold; color: var(--vscode-textLink-foreground); }
             
-            .v-sep { border-left: 1px solid var(--vscode-panel-border); height: 16px; margin: 0 6px; }
+            /* Actions */
+            .toolbar-actions { display: flex; gap: 4px; align-items: center; }
+            .btn { border: none; padding: 4px; cursor: pointer; border-radius: 3px; display: flex; align-items: center; background: transparent; color: var(--vscode-foreground); }
+            .btn:hover { background: var(--vscode-toolbar-hoverBackground); }
+            .btn-flip { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); border: 1px solid #80808066; margin-right: 10px; padding: 2px 8px; font-size: 11px; }
+            .btn-flip.active { background: #007acc; color: white; border-color: transparent; }
+            .btn-delete { color: var(--vscode-errorForeground); cursor: pointer; font-weight: bold; padding: 0 10px; font-size: 18px; opacity: 0.7; }
+            .btn-delete:hover { opacity: 1; }
+            .v-sep { border-left: 1px solid var(--vscode-panel-border); height: 16px; margin: 0 8px; }
         </style>
     </head>
     <body>
@@ -228,14 +244,14 @@ function getWebviewContent() {
             <h3 style="margin:0; font-size: 14px;">Global Viewer</h3>
             <div class="toolbar-actions">
                 <button class="btn" title="Expand All" onclick="setAllCollapse(false)">
-                    <svg viewBox="0 0 16 16"><path d="M11 11H5V5h6v6zm3-9H2v12h12V2zM3 13V3h10v10H3z"/></svg>
+                    <svg width="16" height="16" viewBox="0 0 16 16"><path fill="currentColor" d="M11 11H5V5h6v6zm3-9H2v12h12V2zM3 13V3h10v10H3z"/></svg>
                 </button>
                 <button class="btn" title="Collapse All" onclick="setAllCollapse(true)">
-                    <svg viewBox="0 0 16 16"><path d="M9 9H5V5h4v4zm5-7H2v12h12V2zM3 13V3h10v10H3z"/></svg>                    
+                    <svg width="16" height="16" viewBox="0 0 16 16"><path fill="currentColor" d="M9 9H5V5h4v4zm5-7H2v12h12V2zM3 13V3h10v10H3z"/></svg>                    
                 </button>
                 <div class="v-sep"></div>
-                <button class="btn btn-text btn-pin" onclick="pinTab()">Keep Open</button>
-                <button class="btn btn-text" style="background: var(--vscode-button-secondaryBackground);" onclick="clearAll()">Clear All</button>
+                <button class="btn" style="padding: 4px 10px; font-size: 12px; background: var(--vscode-button-background); color: var(--vscode-button-foreground);" onclick="pinTab()">Keep Open</button>
+                <button class="btn" style="padding: 4px 10px; font-size: 12px; background: var(--vscode-button-secondaryBackground);" onclick="clearAll()">Clear All</button>
             </div>
         </div>
         <div id="container"></div>
@@ -267,7 +283,6 @@ function getWebviewContent() {
                     if (HEB_RANGE.test(w)) w = invpr(w);
                     return w;
                 });
-
                 let resultWords = [];
                 let i = 0;
                 while (i < processed.length) {
@@ -298,9 +313,7 @@ function getWebviewContent() {
             window.addEventListener('message', event => {
                 const message = event.data;
                 if (message.command === 'addEntry') {
-                    // Collapse all existing ones before adding the new one
                     setAllCollapse(true);
-
                     const { server, global, pieces, time } = message;
                     const container = document.getElementById('container');
                     const entry = document.createElement('div');
@@ -319,7 +332,7 @@ function getWebviewContent() {
                                     <button class="btn btn-flip" onclick="event.stopPropagation(); toggleFlip(this)">Original</button>                                    
                                 </span>
                             </div>
-                            <span style="font-size: 11px; opacity: 0.6;">\${time}</span>
+                            <span style="font-size: 11px; opacity: 0.6; margin-right: 10px;">\${time}</span>
                             <div class="btn-delete" onclick="deleteEntry(this, event)">×</div>
                         </div>
                         <div class="content">\${pieceHtml}</div>\`;
