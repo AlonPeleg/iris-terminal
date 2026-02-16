@@ -298,6 +298,9 @@ function getWebviewContent() {
             window.addEventListener('message', event => {
                 const message = event.data;
                 if (message.command === 'addEntry') {
+                    // Collapse all existing ones before adding the new one
+                    setAllCollapse(true);
+
                     const { server, global, pieces, time } = message;
                     const container = document.getElementById('container');
                     const entry = document.createElement('div');
