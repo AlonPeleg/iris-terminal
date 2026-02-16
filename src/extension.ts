@@ -11,7 +11,7 @@ export function activate(context: vscode.ExtensionContext) {
         if (editor && editor.document.uri.scheme === 'isfs') {
             // Strike 1: Immediate
             await vscode.commands.executeCommand('workbench.action.keepEditor');
-            
+
             // Strike 2 & 3: After server handshake/refresh
             [200, 500].forEach(delay => {
                 setTimeout(async () => {
@@ -26,7 +26,7 @@ export function activate(context: vscode.ExtensionContext) {
     let disposable = vscode.commands.registerCommand('iris-terminal.open', async (uri?: vscode.Uri) => {
         const config = vscode.workspace.getConfiguration();
         const serverList: any = config.get('intersystems.servers') || config.get('interSystems.servers') || {};
-        
+
         let activeServerName = '';
         let detectedNamespace = '';
         let targetUri = uri || vscode.window.activeTextEditor?.document.uri;
@@ -50,7 +50,7 @@ export function activate(context: vscode.ExtensionContext) {
             return {
                 label: isMatch ? `$(star-full) ${displayName}` : `$(server) ${displayName}`,
                 description: serverEntry.webServer?.host || serverEntry.host || '',
-                detail: name 
+                detail: name
             };
         });
 
@@ -59,7 +59,7 @@ export function activate(context: vscode.ExtensionContext) {
         const selection = await vscode.window.showQuickPick(serverItems, { placeHolder: 'Select an IRIS server' });
         if (!selection || !selection.detail) return;
 
-        const chosenId = selection.detail; 
+        const chosenId = selection.detail;
         const entry = serverList[chosenId];
         const serverLabel = selection.label.replace('$(star-full) ', '').replace('$(server) ', '');
 
@@ -107,7 +107,7 @@ export function activate(context: vscode.ExtensionContext) {
 
             let globalName = rawLine.includes('=') ? rawLine.split('=')[0].trim() : "Global Reference";
             let valuePart = rawLine.includes('=') ? rawLine.split('=')[1].trim() : rawLine;
-            
+
             valuePart = valuePart.replace(/^"|"$/g, '');
             const pieces = valuePart.split('*');
 
@@ -123,13 +123,13 @@ function showInWebview(server: string, global: string, pieces: string[], time: s
         viewerPanel = vscode.window.createWebviewPanel(
             'globalViewer',
             'Global Viewer',
-            vscode.ViewColumn.Two, 
-            { 
+            vscode.ViewColumn.Two,
+            {
                 enableScripts: true,
-                retainContextWhenHidden: true 
+                retainContextWhenHidden: true
             }
         );
-        
+
         // Handle messages from the webview (The Keep Open button)
         viewerPanel.webview.onDidReceiveMessage(message => {
             if (message.command === 'pinTab') {
@@ -158,40 +158,96 @@ function getWebviewContent() {
         <meta charset="UTF-8">
         <style>
             body { font-family: var(--vscode-editor-font-family); color: var(--vscode-editor-foreground); background: var(--vscode-editor-background); padding: 15px; }
-            .toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; border-bottom: 1px solid var(--vscode-panel-border); padding-bottom: 10px; }
-            .toolbar-actions { display: flex; gap: 8px; }
-            .btn { border: none; padding: 4px 10px; cursor: pointer; border-radius: 2px; font-size: 12px; }
-            .btn-pin { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
-            .btn-clear { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
             
-            .btn-flip { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); margin-right: 10px; border: 1px solid #80808066; }
+            .toolbar { 
+                display: flex; 
+                justify-content: space-between; 
+                align-items: center; 
+                margin-bottom: 15px; 
+                border-bottom: 1px solid var(--vscode-panel-border); 
+                padding-bottom: 10px; 
+                position: sticky; 
+                top: 0; 
+                background: var(--vscode-editor-background); 
+                z-index: 10; 
+            }
+            
+            .toolbar-actions { display: flex; gap: 4px; align-items: center; }
+            
+            .btn { 
+                border: none; 
+                padding: 4px; 
+                cursor: pointer; 
+                border-radius: 3px; 
+                display: flex; 
+                align-items: center; 
+                justify-content: center;
+                background: transparent;
+                color: var(--vscode-foreground);
+            }
+            .btn:hover { background: var(--vscode-toolbar-hoverBackground); }
+            
+            .btn-text { padding: 4px 10px; font-size: 12px; }
+            .btn-pin { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+            .btn-pin:hover { background: var(--vscode-button-hoverBackground); }
+            
+            .btn svg { width: 16px; height: 16px; fill: currentColor; }
+
+            .btn-flip { 
+                background: var(--vscode-button-secondaryBackground); 
+                color: var(--vscode-button-secondaryForeground); 
+                border: 1px solid #80808066; 
+                margin-right: 10px;
+                padding: 2px 8px;
+            }
             .btn-flip.active { background: #007acc; color: white; border-color: transparent; }
 
             .entry { border: 1px solid var(--vscode-panel-border); margin-bottom: 12px; border-radius: 4px; overflow: hidden; position: relative; }
-            .header { background: var(--vscode-editor-lineHighlightBackground); padding: 10px; cursor: pointer; display: flex; align-items: center; font-size: 13px; }
+            .header { background: var(--vscode-editor-lineHighlightBackground); padding: 8px 10px; cursor: pointer; display: flex; align-items: center; font-size: 13px; }
+            .header:hover { background: var(--vscode-list-hoverBackground); }
             .header-text { flex-grow: 1; display: flex; justify-content: space-between; align-items: center; margin-right: 10px; }
-            .btn-delete { color: var(--vscode-errorForeground); cursor: pointer; font-weight: bold; padding: 5px 10px; font-size: 16px; border-radius: 4px; }
+            
+            .btn-delete { color: var(--vscode-errorForeground); cursor: pointer; font-weight: bold; padding: 0 10px; font-size: 18px; opacity: 0.7; }
+            .btn-delete:hover { opacity: 1; }
+
             .content { padding: 10px; display: block; border-top: 1px solid var(--vscode-panel-border); background: var(--vscode-editor-background); }
-            .hidden { display: none; }
-            .piece { display: flex; gap: 15px; border-bottom: 1px solid #80808033; padding: 4px 5px; font-size: 12px; }
-            .num { color: var(--vscode-symbolIcon-numberForeground); font-weight: bold; min-width: 25px; text-align: right; }
-            .arrow { display: inline-block; width: 10px; transition: transform 0.1s; margin-right: 8px; }
+            
+            .entry.collapsed .content { display: none; }
             .entry.collapsed .arrow { transform: rotate(-90deg); }
+
+            .piece { display: flex; gap: 15px; border-bottom: 1px solid #80808022; padding: 4px 5px; font-size: 12px; }
+            .num { color: var(--vscode-descriptionForeground); font-weight: bold; min-width: 20px; text-align: right; font-family: monospace; }
+            .arrow { display: inline-block; width: 10px; transition: transform 0.1s; margin-right: 8px; font-size: 10px; }
             .server-info { font-weight: bold; color: var(--vscode-textLink-foreground); }
+            
+            .v-sep { border-left: 1px solid var(--vscode-panel-border); height: 16px; margin: 0 6px; }
         </style>
     </head>
     <body>
         <div class="toolbar">
-            <h3 style="margin:0">Global Viewer</h3>
+            <h3 style="margin:0; font-size: 14px;">Global Viewer</h3>
             <div class="toolbar-actions">
-                <button class="btn btn-pin" onclick="pinTab()">Keep Open</button>
-                <button class="btn btn-clear" onclick="clearAll()">Clear All</button>
+                <button class="btn" title="Expand All" onclick="setAllCollapse(false)">
+                    <svg viewBox="0 0 16 16"><path d="M11 11H5V5h6v6zm3-9H2v12h12V2zM3 13V3h10v10H3z"/></svg>
+                </button>
+                <button class="btn" title="Collapse All" onclick="setAllCollapse(true)">
+                    <svg viewBox="0 0 16 16"><path d="M9 9H5V5h4v4zm5-7H2v12h12V2zM3 13V3h10v10H3z"/></svg>                    
+                </button>
+                <div class="v-sep"></div>
+                <button class="btn btn-text btn-pin" onclick="pinTab()">Keep Open</button>
+                <button class="btn btn-text" style="background: var(--vscode-button-secondaryBackground);" onclick="clearAll()">Clear All</button>
             </div>
         </div>
         <div id="container"></div>
         <script>
             const vscode = acquireVsCodeApi();
             const HEB_RANGE = /[\\u0590-\\u05FF]/;
+
+            function setAllCollapse(shouldCollapse) {
+                document.querySelectorAll('.entry').forEach(e => {
+                    shouldCollapse ? e.classList.add('collapsed') : e.classList.remove('collapsed');
+                });
+            }
 
             function invpr(t) {
                 if (!t) return t;
@@ -204,30 +260,20 @@ function getWebviewContent() {
 
             function WG(str) {
                 if (!str) return "";
-                // 1. Normalize and split into words
                 let s = str.replace(/\\u00A0/g, ' ').trim();
                 let words = s.split(' ');
-                
-                // 2. Process words for symbols and parentheses
                 let processed = words.map(w => {
                     if (w.endsWith('%')) w = '%' + w.slice(0, -1);
                     if (HEB_RANGE.test(w)) w = invpr(w);
                     return w;
                 });
 
-                // 3. IDENTIFY ENGLISH BLOCKS (This is what fixes "LR DIAMONDX G9")
-                // We find sequences of words that DON'T contain Hebrew and reverse that whole block
-                // so the final total reverse puts them back in correct order.
                 let resultWords = [];
                 let i = 0;
                 while (i < processed.length) {
                     if (!HEB_RANGE.test(processed[i])) {
                         let j = i;
-                        // Find the end of this English/Number sequence
                         while (j < processed.length && !HEB_RANGE.test(processed[j])) { j++; }
-                        
-                        // Take the block (e.g., ["LR", "DIAMONDX", "G9"]), reverse the order
-                        // AND reverse each word's characters.
                         let block = processed.slice(i, j).reverse().map(w => w.split('').reverse().join(''));
                         resultWords.push(...block);
                         i = j;
@@ -236,17 +282,14 @@ function getWebviewContent() {
                         i++;
                     }
                 }
-
-                // 4. Final total reverse ($RE)
                 return resultWords.join(' ').split('').reverse().join('');
             }
 
             function toggleFlip(btn) {
                 const entry = btn.closest('.entry');
                 const isNowActive = btn.classList.toggle('active');
-                btn.innerText = isNowActive ? 'Original' : 'Flipped';
-                const valSpans = entry.querySelectorAll('.piece-val');
-                valSpans.forEach(span => {
+                btn.innerText = isNowActive ? 'Flipped' : 'Original';
+                entry.querySelectorAll('.piece-val').forEach(span => {
                     const original = span.getAttribute('data-orig');
                     span.innerText = isNowActive ? WG(original) : original;
                 });
@@ -270,10 +313,10 @@ function getWebviewContent() {
                             <div class="header-text">
                                 <span><span class="server-info">\${server}</span> » <b>\${global}</b></span>
                                 <span>
-                                    <button class="btn btn-flip" onclick="event.stopPropagation(); toggleFlip(this)">Flipped</button>
-                                    <span style="font-size: 11px; opacity: 0.6;">\${time}</span>
+                                    <button class="btn btn-flip" onclick="event.stopPropagation(); toggleFlip(this)">Original</button>                                    
                                 </span>
                             </div>
+                            <span style="font-size: 11px; opacity: 0.6;">\${time}</span>
                             <div class="btn-delete" onclick="deleteEntry(this, event)">×</div>
                         </div>
                         <div class="content">\${pieceHtml}</div>\`;
@@ -284,10 +327,7 @@ function getWebviewContent() {
             function pinTab() { vscode.postMessage({ command: 'pinTab' }); }
             function clearAll() { document.getElementById('container').innerHTML = ''; }
             function deleteEntry(btn, e) { e.stopPropagation(); btn.closest('.entry').remove(); }
-            function toggleEntry(header) {
-                header.parentElement.classList.toggle('collapsed');
-                header.nextElementSibling.classList.toggle('hidden');
-            }
+            function toggleEntry(header) { header.parentElement.classList.toggle('collapsed'); }
         </script>
     </body>
     </html>`;
@@ -295,10 +335,10 @@ function getWebviewContent() {
 
 function openTerminal(host: string, user: string, pass: string, serverId: string, serverDisplayName: string, initialNamespace: string, encoding: string) {
     const writeEmitter = new vscode.EventEmitter<string>();
-    let client: any; 
+    let client: any;
     let userSent = false, passSent = false, nsSent = false;
     let isConnected = false;
-    
+
     let terminal: vscode.Terminal | undefined;
     let lastKnownNS = initialNamespace.toUpperCase();
     const getTerminalTitle = (ns: string) => `IRIS: ${serverDisplayName}${ns ? ' - ' + ns : ''}`;
@@ -322,11 +362,11 @@ function openTerminal(host: string, user: string, pass: string, serverId: string
         open: () => {
             const connect = (trySSL: boolean) => {
                 client = trySSL ? tls.connect({ host, port: 23, rejectUnauthorized: false, timeout: 1500 }) : net.createConnection(23, host);
-                
+
                 client.on('data', (data: Buffer) => {
                     if (!isConnected && trySSL) writeEmitter.fire('\x1b[32m[Encrypted SSL Connection]\x1b[0m\r\n');
                     isConnected = true;
-                    
+
                     const str = decoder.decode(data);
                     writeEmitter.fire(str.replace(/\n/g, '\r\n'));
 
@@ -338,36 +378,36 @@ function openTerminal(host: string, user: string, pass: string, serverId: string
                         const currentNS = promptMatch[1].toUpperCase();
                         if (currentNS !== lastKnownNS) {
                             lastKnownNS = currentNS;
-                            vscode.commands.executeCommand('workbench.action.terminal.renameWithArg', { 
-                                name: getTerminalTitle(currentNS) 
+                            vscode.commands.executeCommand('workbench.action.terminal.renameWithArg', {
+                                name: getTerminalTitle(currentNS)
                             });
                         }
                     }
 
                     const lowerStr = str.toLowerCase();
                     if (user && !userSent && (lowerStr.includes('login:') || lowerStr.includes('username:'))) {
-                        userSent = true; 
+                        userSent = true;
                         client.write(user + '\r\n');
                     }
                     if (pass && !passSent && lowerStr.includes('password:')) {
-                        passSent = true; 
+                        passSent = true;
                         client.write(pass + '\r\n');
                     }
                     if (initialNamespace && !nsSent && passSent && str.includes('>')) {
-                        nsSent = true; 
+                        nsSent = true;
                         client.write('zn "' + initialNamespace + '"\r\n');
                     }
                 });
 
                 client.on('error', (err: any) => {
-                    if (trySSL && !isConnected) connect(false); 
+                    if (trySSL && !isConnected) connect(false);
                     else writeEmitter.fire('\r\n\x1b[31mConnection Error: ' + err.message + '\x1b[0m\r\n');
                 });
             };
             connect(true);
         },
         close: () => { if (client) client.destroy(); },
-        handleInput: (data) => { 
+        handleInput: (data) => {
             if (client) {
                 // Intercept HOME (VT100 / Xterm)
                 if (data === '\x1b[H' || data === '\x1b[1~') {
@@ -379,9 +419,9 @@ function openTerminal(host: string, user: string, pass: string, serverId: string
                     client.write('\x1b[4~'); // IRIS often prefers the ~ sequence
                     return;
                 }
-                
+
                 // Default: Encode and send
-                client.write(encodeInput(data)); 
+                client.write(encodeInput(data));
             }
         }
     };
