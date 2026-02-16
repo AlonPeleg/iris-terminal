@@ -162,15 +162,15 @@ function getWebviewContent() {
             .toolbar-actions { display: flex; gap: 8px; }
             .btn { border: none; padding: 4px 10px; cursor: pointer; border-radius: 2px; font-size: 12px; }
             .btn-pin { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
-            .btn-pin:hover { background: var(--vscode-button-hoverBackground); }
             .btn-clear { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
-            .btn-clear:hover { background: var(--vscode-button-secondaryHoverBackground); }
+            
+            .btn-flip { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); margin-right: 10px; border: 1px solid #80808066; }
+            .btn-flip.active { background: #007acc; color: white; border-color: transparent; }
+
             .entry { border: 1px solid var(--vscode-panel-border); margin-bottom: 12px; border-radius: 4px; overflow: hidden; position: relative; }
             .header { background: var(--vscode-editor-lineHighlightBackground); padding: 10px; cursor: pointer; display: flex; align-items: center; font-size: 13px; }
-            .header:hover { background: var(--vscode-list-hoverBackground); }
             .header-text { flex-grow: 1; display: flex; justify-content: space-between; align-items: center; margin-right: 10px; }
-            .btn-delete { color: var(--vscode-errorForeground); cursor: pointer; font-weight: bold; padding: 5px 10px; font-size: 16px; border-radius: 4px; line-height: 1; }
-            .btn-delete:hover { background: var(--vscode-toolbar-hoverBackground); }
+            .btn-delete { color: var(--vscode-errorForeground); cursor: pointer; font-weight: bold; padding: 5px 10px; font-size: 16px; border-radius: 4px; }
             .content { padding: 10px; display: block; border-top: 1px solid var(--vscode-panel-border); background: var(--vscode-editor-background); }
             .hidden { display: none; }
             .piece { display: flex; gap: 15px; border-bottom: 1px solid #80808033; padding: 4px 5px; font-size: 12px; }
@@ -191,23 +191,65 @@ function getWebviewContent() {
         <div id="container"></div>
         <script>
             const vscode = acquireVsCodeApi();
-            
-            function pinTab() {
-                vscode.postMessage({ command: 'pinTab' });
+            const HEB_RANGE = /[\\u0590-\\u05FF]/;
+
+            function invpr(t) {
+                if (!t) return t;
+                let chars = t.split('');
+                const pairs = {'(':')', ')':'(', '<':'>', '>':'<', '{':'}', '}':'{', '[':']', ']':'['};
+                if (pairs[chars[0]]) chars[0] = pairs[chars[0]];
+                if (pairs[chars[chars.length-1]]) chars[chars.length-1] = pairs[chars[chars.length-1]];
+                return chars.join('');
             }
 
-            function clearAll() { document.getElementById('container').innerHTML = ''; }
-            
-            function deleteEntry(btn, event) { 
-                event.stopPropagation();
-                btn.closest('.entry').remove(); 
+            function WG(str) {
+                if (!str) return "";
+                // 1. Normalize and split into words
+                let s = str.replace(/\\u00A0/g, ' ').trim();
+                let words = s.split(' ');
+                
+                // 2. Process words for symbols and parentheses
+                let processed = words.map(w => {
+                    if (w.endsWith('%')) w = '%' + w.slice(0, -1);
+                    if (HEB_RANGE.test(w)) w = invpr(w);
+                    return w;
+                });
+
+                // 3. IDENTIFY ENGLISH BLOCKS (This is what fixes "LR DIAMONDX G9")
+                // We find sequences of words that DON'T contain Hebrew and reverse that whole block
+                // so the final total reverse puts them back in correct order.
+                let resultWords = [];
+                let i = 0;
+                while (i < processed.length) {
+                    if (!HEB_RANGE.test(processed[i])) {
+                        let j = i;
+                        // Find the end of this English/Number sequence
+                        while (j < processed.length && !HEB_RANGE.test(processed[j])) { j++; }
+                        
+                        // Take the block (e.g., ["LR", "DIAMONDX", "G9"]), reverse the order
+                        // AND reverse each word's characters.
+                        let block = processed.slice(i, j).reverse().map(w => w.split('').reverse().join(''));
+                        resultWords.push(...block);
+                        i = j;
+                    } else {
+                        resultWords.push(processed[i]);
+                        i++;
+                    }
+                }
+
+                // 4. Final total reverse ($RE)
+                return resultWords.join(' ').split('').reverse().join('');
             }
 
-            function toggleEntry(headerElement) {
-                const entry = headerElement.parentElement;
-                const content = headerElement.nextElementSibling;
-                entry.classList.toggle('collapsed');
-                content.classList.toggle('hidden');
+            function toggleFlip(btn) {
+                const entry = btn.closest('.entry');
+                const isNowActive = btn.classList.toggle('active');
+                btn.innerText = isNowActive ? 'Original' : 'Flipped';
+                const valSpans = entry.querySelectorAll('.piece-val');
+                valSpans.forEach(span => {
+                    const original = span.getAttribute('data-orig');
+                    span.innerText = isNowActive ? WG(original) : original;
+                });
             }
 
             window.addEventListener('message', event => {
@@ -220,23 +262,32 @@ function getWebviewContent() {
                     const pieceHtml = pieces.map((p, i) => \`
                         <div class="piece">
                             <span class="num">\${i+1}</span> 
-                            <span>\${p === "" ? "<span style='opacity:0.3'>[empty]</span>" : p}</span>
+                            <span class="piece-val" data-orig="\${p}">\${p === "" ? "<span style='opacity:0.3'>[empty]</span>" : p}</span>
                         </div>\`).join('');
-                    
                     entry.innerHTML = \`
                         <div class="header" onclick="toggleEntry(this)">
                             <span class="arrow">▼</span>
                             <div class="header-text">
                                 <span><span class="server-info">\${server}</span> » <b>\${global}</b></span>
-                                <span style="font-size: 11px; opacity: 0.6;">\${time}</span>
+                                <span>
+                                    <button class="btn btn-flip" onclick="event.stopPropagation(); toggleFlip(this)">Flipped</button>
+                                    <span style="font-size: 11px; opacity: 0.6;">\${time}</span>
+                                </span>
                             </div>
-                            <div class="btn-delete" title="Delete entry" onclick="deleteEntry(this, event)">×</div>
+                            <div class="btn-delete" onclick="deleteEntry(this, event)">×</div>
                         </div>
-                        <div class="content">\${pieceHtml}</div>
-                    \`;
+                        <div class="content">\${pieceHtml}</div>\`;
                     container.prepend(entry);
                 }
             });
+
+            function pinTab() { vscode.postMessage({ command: 'pinTab' }); }
+            function clearAll() { document.getElementById('container').innerHTML = ''; }
+            function deleteEntry(btn, e) { e.stopPropagation(); btn.closest('.entry').remove(); }
+            function toggleEntry(header) {
+                header.parentElement.classList.toggle('collapsed');
+                header.nextElementSibling.classList.toggle('hidden');
+            }
         </script>
     </body>
     </html>`;
