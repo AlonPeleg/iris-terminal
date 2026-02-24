@@ -20,6 +20,12 @@
         "icon": "$(terminal)"
       }
     ],
+    "keybindings": [
+      {
+        "command": "iris-terminal.open",
+        "key": "ctrl+alt+t"
+      }
+    ],
     "menus": {
       "view/title": [
         {
