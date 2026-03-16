@@ -90,7 +90,8 @@ export function activate(context: vscode.ExtensionContext) {
     let linkProvider = vscode.window.registerTerminalLinkProvider({
         provideTerminalLinks: (context: vscode.TerminalLinkContext) => {
             const line = context.line.trim();
-            if (line.startsWith('^') || line.includes('=^') || (line.includes('^') && line.includes('='))) {
+            //if (line.startsWith('^') || line.includes('=^') || (line.includes('^') && line.includes('='))) { // This is the original logic for globals only
+            if (line.includes('=')) {   // This is the new logic for globals and and vectors and variables
                 return [{
                     startIndex: 0,
                     length: context.line.length,
