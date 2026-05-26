@@ -4,6 +4,9 @@ import * as tls from 'tls';
 
 let viewerPanel: vscode.WebviewPanel | undefined;
 
+// Keep track of the active socket stream instances by terminal name
+const terminalClients = new Map<string, any>();
+
 export function activate(context: vscode.ExtensionContext) {
 
     // --- ENHANCED AUTO-PIN LISTENER ---
@@ -90,8 +93,7 @@ export function activate(context: vscode.ExtensionContext) {
     let linkProvider = vscode.window.registerTerminalLinkProvider({
         provideTerminalLinks: (context: vscode.TerminalLinkContext) => {
             const line = context.line.trim();
-            //if (line.startsWith('^') || line.includes('=^') || (line.includes('^') && line.includes('='))) { // This is the original logic for globals only
-            if (line.includes('=')) {   // This is the new logic for globals and and vectors and variables
+            if (line.includes('=')) {   
                 return [{
                     startIndex: 0,
                     length: context.line.length,
@@ -116,7 +118,35 @@ export function activate(context: vscode.ExtensionContext) {
         }
     });
 
-    context.subscriptions.push(disposable, linkProvider, pinListener);
+    // --- RIGHT-CLICK SWITCH NAMESPACE COMMAND ---
+    let switchNamespaceDisposable = vscode.commands.registerCommand('iris-terminal.switchNamespace', async (terminalContext?: any) => {
+        let targetTerminal: vscode.Terminal | undefined;
+
+        if (terminalContext && terminalContext.terminalId) {
+            targetTerminal = vscode.window.terminals.find(t => (t as any).id === terminalContext.terminalId);
+        }
+        if (!targetTerminal) {
+            targetTerminal = vscode.window.activeTerminal;
+        }
+        if (!targetTerminal || !targetTerminal.name.startsWith('IRIS:')) return;
+
+        const clientInstance = terminalClients.get(targetTerminal.name);
+        if (!clientInstance) return;
+
+        targetTerminal.show();
+
+        // One line execution context string to safely pause for terminal inputs before modifying instances
+        const singleLineInteractivePrompt = 
+            "d ##class(%SYS.Namespace).ListAll(.res) s num=0,ns=\"\" f { s ns=$o(res(ns)) q:ns=\"\"  s num=num+1,idx(num)=ns w !,num,\" - \",ns } r !!, \"Select Namespace Number: \",input s target=$g(idx(input)) i target'=\"\" { zn target } else { w \" -> Selection Canceled.\" } k res,num,ns,idx,input,target w !" + "\r\n";
+
+        clientInstance.write(singleLineInteractivePrompt);
+    });
+
+    let terminalCloseListener = vscode.window.onDidCloseTerminal((terminal) => {
+        terminalClients.delete(terminal.name);
+    });
+
+    context.subscriptions.push(disposable, linkProvider, pinListener, switchNamespaceDisposable, terminalCloseListener);
 }
 
 function showInWebview(server: string, global: string, pieces: string[], time: string) {
@@ -131,7 +161,6 @@ function showInWebview(server: string, global: string, pieces: string[], time: s
             }
         );
 
-        // Handle messages from the webview (The Keep Open button)
         viewerPanel.webview.onDidReceiveMessage(message => {
             if (message.command === 'pinTab') {
                 vscode.commands.executeCommand('workbench.action.keepEditor');
@@ -165,7 +194,6 @@ function getWebviewContent() {
                 padding: 15px; 
                 margin: 0;
             }
-            
             .toolbar { 
                 display: flex; 
                 justify-content: space-between; 
@@ -177,7 +205,6 @@ function getWebviewContent() {
                 background: var(--vscode-editor-background); 
                 z-index: 1000; 
             }
-
             .entry { 
                 border: 1px solid var(--vscode-panel-border); 
                 margin-bottom: 20px; 
@@ -186,9 +213,7 @@ function getWebviewContent() {
                 display: flex;
                 flex-direction: column;
             }
-            
             .header { 
-                /* Solid background is key to stop transparency */
                 background: var(--vscode-sideBar-background); 
                 padding: 10px 12px; 
                 cursor: pointer; 
@@ -196,25 +221,20 @@ function getWebviewContent() {
                 align-items: center; 
                 font-size: 13px;
                 position: sticky;
-                top: 42px; /* Sticks just below the main toolbar */
+                top: 42px;
                 z-index: 100;
                 border-bottom: 1px solid var(--vscode-panel-border);
             }
             .header:hover { background: var(--vscode-list-hoverBackground); }
-            
             .header-text { flex-grow: 1; display: flex; justify-content: space-between; align-items: center; margin-right: 10px; }
-            
-            /* Each Global is now its own scrollable box */
             .content { 
                 max-height: 400px; 
                 overflow-y: auto; 
                 background: var(--vscode-editor-background);
             }
-
             .entry.collapsed .content { display: none; }
             .entry.collapsed .header { position: static; border-bottom: none; }
             .entry.collapsed .arrow { transform: rotate(-90deg); }
-
             .piece { 
                 display: flex; 
                 gap: 15px; 
@@ -223,13 +243,10 @@ function getWebviewContent() {
                 font-size: 12px; 
             }
             .piece:last-child { border-bottom: none; }
-            
             .num { color: var(--vscode-descriptionForeground); font-weight: bold; min-width: 25px; text-align: right; font-family: monospace; opacity: 0.6; }
             .piece-val { white-space: pre-wrap; word-break: break-all; }
             .arrow { display: inline-block; width: 10px; transition: transform 0.1s; margin-right: 8px; font-size: 10px; }
             .server-info { font-weight: bold; color: var(--vscode-textLink-foreground); }
-            
-            /* Actions */
             .toolbar-actions { display: flex; gap: 4px; align-items: center; }
             .btn { border: none; padding: 4px; cursor: pointer; border-radius: 3px; display: flex; align-items: center; background: transparent; color: var(--vscode-foreground); }
             .btn:hover { background: var(--vscode-toolbar-hoverBackground); }
@@ -387,16 +404,21 @@ function openTerminal(host: string, user: string, pass: string, serverId: string
                     const str = decoder.decode(data);
                     writeEmitter.fire(str.replace(/\n/g, '\r\n'));
 
-                    // --- IMPROVED TRACKING REGEX ---
-                    // This matches patterns like USER> or NAMESPACE> only when they appear 
-                    // after a newline, avoiding <SYNTAX> or <UNDEFINED> errors.
                     const promptMatch = str.match(/(?:\r\n|\n|^)([A-Z0-9%]+)>/i);
                     if (promptMatch && promptMatch[1] && terminal) {
                         const currentNS = promptMatch[1].toUpperCase();
                         if (currentNS !== lastKnownNS) {
+                            const oldTitle = getTerminalTitle(lastKnownNS);
                             lastKnownNS = currentNS;
+                            const newTitle = getTerminalTitle(currentNS);
+
+                            if (terminalClients.has(oldTitle)) {
+                                terminalClients.delete(oldTitle);
+                            }
+                            terminalClients.set(newTitle, client);
+
                             vscode.commands.executeCommand('workbench.action.terminal.renameWithArg', {
-                                name: getTerminalTitle(currentNS)
+                                name: newTitle
                             });
                         }
                     }
@@ -426,25 +448,21 @@ function openTerminal(host: string, user: string, pass: string, serverId: string
         close: () => { if (client) client.destroy(); },
         handleInput: (data) => {
             if (client) {
-                // Intercept HOME (VT100 / Xterm)
                 if (data === '\x1b[H' || data === '\x1b[1~') {
-                    client.write('\x1b[1~'); // IRIS often prefers the ~ sequence
+                    client.write('\x1b[1~');
                     return;
                 }
-                // Intercept END (VT100 / Xterm)
                 if (data === '\x1b[F' || data === '\x1b[4~') {
-                    client.write('\x1b[4~'); // IRIS often prefers the ~ sequence
+                    client.write('\x1b[4~');
                     return;
                 }
-
-                // Default: Encode and send
                 client.write(encodeInput(data));
             }
         }
     };
 
-    terminal = vscode.window.createTerminal({ name: getTerminalTitle(initialNamespace), pty });
+    const initialTitle = getTerminalTitle(initialNamespace);
+    terminal = vscode.window.createTerminal({ name: initialTitle, pty });
+    terminalClients.set(initialTitle, client);
     terminal.show();
 }
-// npm run compile - to compile the extension
-// vsce package --skip-license

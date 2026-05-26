@@ -18,6 +18,10 @@
         "command": "iris-terminal.open",
         "title": "IRIS: Open Terminal",
         "icon": "$(terminal)"
+      },
+      {
+        "command": "iris-terminal.switchNamespace",
+        "title": "Switch Namespace..."
       }
     ],
     "keybindings": [
@@ -38,6 +42,13 @@
         {
           "command": "iris-terminal.open",
           "group": "navigation"
+        }
+      ],
+      "terminal/title/context": [
+        {
+          "command": "iris-terminal.switchNamespace",
+          "when": "terminalHasBeenCreated",
+          "group": "1_modification"
         }
       ]
     }
