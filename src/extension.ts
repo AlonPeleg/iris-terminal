@@ -466,3 +466,5 @@ function openTerminal(host: string, user: string, pass: string, serverId: string
     terminalClients.set(initialTitle, client);
     terminal.show();
 }
+// npm run compile - to compile the extension
+// vsce package --skip-license
