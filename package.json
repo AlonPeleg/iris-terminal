@@ -3,7 +3,7 @@
   "displayName": "iris-terminal",
   "description": "Auto-SSL Terminal Bridge for InterSystems",
   "publisher": "alonpe",
-  "version": "0.1.9",
+  "version": "0.1.15",
   "engines": {
     "vscode": "^1.108.1"
   },
@@ -22,6 +22,14 @@
       {
         "command": "iris-terminal.switchNamespace",
         "title": "Switch Namespace..."
+      },
+      {
+        "command": "iris-terminal.reconnect",
+        "title": "IRIS: Reconnect Terminal"
+      },
+      {
+        "command": "iris-terminal.clearStoredPassword",
+        "title": "IRIS: Clear Stored Password..."
       }
     ],
     "keybindings": [
@@ -49,8 +57,34 @@
           "command": "iris-terminal.switchNamespace",
           "when": "terminalHasBeenCreated",
           "group": "1_modification"
+        },
+        {
+          "command": "iris-terminal.reconnect",
+          "when": "terminalHasBeenCreated",
+          "group": "1_modification"
         }
       ]
+    },
+    "configuration": {
+      "title": "IRIS Terminal",
+      "properties": {
+        "iris-terminal.sslMode": {
+          "type": "string",
+          "enum": ["require", "prefer", "off"],
+          "default": "prefer",
+          "description": "require: only connect over SSL/TLS, fail otherwise. prefer: try SSL first, fall back to unencrypted Telnet (with a warning banner). off: always connect unencrypted."
+        },
+        "iris-terminal.tls.rejectUnauthorized": {
+          "type": "boolean",
+          "default": false,
+          "description": "Verify the server's TLS certificate. Off by default because many IRIS/Caché servers use self-signed certificates; enable this if your server has a certificate signed by a trusted CA."
+        },
+        "iris-terminal.port": {
+          "type": "number",
+          "default": 23,
+          "description": "Telnet/SSL port to connect to on the IRIS/Caché server."
+        }
+      }
     }
   },
   "scripts": {
