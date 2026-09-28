@@ -3,6 +3,25 @@ import * as net from 'net';
 import * as tls from 'tls';
 
 let viewerPanel: vscode.WebviewPanel | undefined;
+// True once the currently-open Global Viewer webview's script has announced itself as 'ready'
+// (registered its message listener). Reset to false whenever a fresh panel is created, since a
+// brand-new webview's script hasn't run yet and would silently drop a message sent too early.
+let viewerPanelReady = false;
+// Adds that arrive before the (re)created panel is ready get queued here and flushed once it is,
+// instead of being lost to the classic "postMessage before the listener exists" race.
+let queuedViewerAdds: { server: string; global: string; value: string; time: string }[] = [];
+// Extension-wide handle used for globalState access from functions outside activate().
+let extContext: vscode.ExtensionContext | undefined;
+const VIEWER_STATE_KEY = 'iris-terminal.globalViewerState';
+// The webview is the source of truth for its own rich entry objects (delimiter, flipped, collapsed,
+// pieceSearch, hideEmpty, ...); every time it persists, it also mirrors that state here via
+// 'syncState' so a fully-closed-and-reopened panel can be hydrated from something durable instead of
+// starting empty (a webview's own vscode.setState() doesn't survive the panel being disposed).
+let lastKnownViewerState: { entries: any[]; viewMode: string } = { entries: [], viewMode: 'grid' };
+// The terminal that was focused right when a brand-new Global Viewer panel got created — stashed so
+// the 'ready' handler can briefly focus the panel (to make "keep editor" unambiguous) and then hand
+// focus straight back, instead of leaving it stuck on the panel.
+let pendingKeepEditorTerminal: vscode.Terminal | undefined;
 
 export type SslMode = 'require' | 'prefer' | 'off';
 
@@ -44,6 +63,9 @@ function getSecretKey(serverId: string, user: string): string {
 }
 
 export function activate(context: vscode.ExtensionContext) {
+
+    extContext = context;
+    lastKnownViewerState = context.globalState.get<{ entries: any[]; viewMode: string }>(VIEWER_STATE_KEY, { entries: [], viewMode: 'grid' });
 
     // --- ENHANCED AUTO-PIN LISTENER ---
     const pinListener = vscode.window.onDidChangeActiveTextEditor(async (editor) => {
@@ -290,7 +312,26 @@ export function activate(context: vscode.ExtensionContext) {
 
     registerViewerPanelSerializer(context);
 
-    context.subscriptions.push(disposable, linkProvider, pinListener, switchNamespaceDisposable, reconnectDisposable, clearPasswordDisposable, terminalCloseListener);
+    // Tracks the Global Viewer tab's real preview/pinned status (whatever the cause — our own
+    // auto-keep, the manual pin button, or the user pinning it themselves via the tab's context
+    // menu) so the webview can hide its pin icon once there's genuinely nothing left to pin.
+    const viewerTabsListener = vscode.window.tabGroups.onDidChangeTabs(() => updateViewerPinnedState());
+
+    context.subscriptions.push(disposable, linkProvider, pinListener, switchNamespaceDisposable, reconnectDisposable, clearPasswordDisposable, terminalCloseListener, viewerTabsListener);
+}
+
+// Looks up the Global Viewer's own tab (if it's currently open) across all tab groups/windows and
+// tells the webview whether it's still a preview tab, so it can show/hide its pin icon accordingly.
+function updateViewerPinnedState() {
+    if (!viewerPanel) return;
+    for (const group of vscode.window.tabGroups.all) {
+        for (const tab of group.tabs) {
+            if (tab.input instanceof vscode.TabInputWebview && tab.input.viewType.includes('globalViewer')) {
+                viewerPanel.webview.postMessage({ command: 'previewState', isPreview: !!tab.isPreview });
+                return;
+            }
+        }
+    }
 }
 
 function createViewerPanel(): vscode.WebviewPanel {
@@ -303,6 +344,8 @@ function createViewerPanel(): vscode.WebviewPanel {
             retainContextWhenHidden: true
         }
     );
+    viewerPanelReady = false;
+    queuedViewerAdds = [];
     wireViewerPanel(panel);
     return panel;
 }
@@ -310,15 +353,48 @@ function createViewerPanel(): vscode.WebviewPanel {
 function wireViewerPanel(panel: vscode.WebviewPanel) {
     panel.webview.onDidReceiveMessage(message => {
         if (message.command === 'pinTab') {
-            vscode.commands.executeCommand('workbench.action.keepEditor');
+            Promise.resolve(vscode.commands.executeCommand('workbench.action.keepEditor')).then(() => updateViewerPinnedState());
+        } else if (message.command === 'moveToNewWindow') {
+            vscode.commands.executeCommand('workbench.action.moveEditorToNewWindow');
+        } else if (message.command === 'ready') {
+            // A brand-new tab opens as a "preview" tab (italic title, silently replaced by the next
+            // preview-opened editor) until something explicitly keeps it. `workbench.action.keepEditor`
+            // only acts on whatever VS Code currently considers the active editor pane — calling it
+            // with preserveFocus still in effect left that ambiguous and the command didn't reliably
+            // land on this panel. So: briefly give the panel real focus (removing all ambiguity about
+            // which editor is "active"), pin it, then hand focus straight back to whatever terminal
+            // the user was in, so nothing visibly changes for them beyond the tab losing its italics.
+            const terminalToRestore = pendingKeepEditorTerminal;
+            pendingKeepEditorTerminal = undefined;
+            panel.reveal(panel.viewColumn ?? vscode.ViewColumn.Two, false);
+            Promise.resolve(vscode.commands.executeCommand('workbench.action.keepEditor')).then(() => {
+                if (terminalToRestore) terminalToRestore.show(false);
+                updateViewerPinnedState();
+            });
+            // The fresh webview's script has registered its message listener — safe to hydrate it
+            // now. Send the durable snapshot first, then flush anything that tried to arrive while
+            // this panel was still loading (see showInWebview).
+            viewerPanelReady = true;
+            panel.webview.postMessage({ command: 'initEntries', entries: lastKnownViewerState.entries, viewMode: lastKnownViewerState.viewMode });
+            queuedViewerAdds.forEach(add => panel.webview.postMessage({ command: 'addEntry', ...add }));
+            queuedViewerAdds = [];
+        } else if (message.command === 'syncState') {
+            lastKnownViewerState = {
+                entries: Array.isArray(message.entries) ? message.entries : [],
+                viewMode: message.viewMode === 'grid' ? 'grid' : 'list'
+            };
+            if (extContext) extContext.globalState.update(VIEWER_STATE_KEY, lastKnownViewerState);
         }
     });
-    panel.onDidDispose(() => { if (viewerPanel === panel) viewerPanel = undefined; });
+    panel.onDidDispose(() => {
+        if (viewerPanel === panel) { viewerPanel = undefined; viewerPanelReady = false; queuedViewerAdds = []; }
+    });
     panel.webview.html = getWebviewContent(panel.webview.cspSource);
 }
 
-// Lets VS Code recreate the Global Viewer (with its persisted history intact, via the
-// webview's own getState/setState) after the window reloads or the panel is reopened.
+// Lets VS Code recreate the Global Viewer after the window reloads while the tab was open. The
+// panel is hydrated the same way a freshly-created one is (see the 'ready' handler above), from the
+// durable extension-side snapshot rather than relying on the webview's own transient state.
 function registerViewerPanelSerializer(context: vscode.ExtensionContext) {
     if (!vscode.window.registerWebviewPanelSerializer) return;
     context.subscriptions.push(
@@ -326,6 +402,8 @@ function registerViewerPanelSerializer(context: vscode.ExtensionContext) {
             deserializeWebviewPanel: async (panel: vscode.WebviewPanel) => {
                 panel.webview.options = { enableScripts: true };
                 viewerPanel = panel;
+                viewerPanelReady = false;
+                queuedViewerAdds = [];
                 wireViewerPanel(panel);
             }
         })
@@ -337,13 +415,14 @@ function showInWebview(server: string, global: string, value: string, time: stri
         viewerPanel = createViewerPanel();
     }
 
-    viewerPanel.webview.postMessage({
-        command: 'addEntry',
-        server,
-        global,
-        value,
-        time
-    });
+    // If the panel's webview script hasn't announced itself as 'ready' yet (it just got (re)created
+    // and is still loading), sending 'addEntry' now would race the listener registration and the
+    // message would simply be dropped — queue it instead; the 'ready' handler flushes the queue.
+    if (viewerPanelReady) {
+        viewerPanel.webview.postMessage({ command: 'addEntry', server, global, value, time });
+    } else {
+        queuedViewerAdds.push({ server, global, value, time });
+    }
     viewerPanel.reveal(vscode.ViewColumn.Two, true);
 }
 
@@ -449,12 +528,62 @@ function getWebviewContent(cspSource: string) {
                 padding: 2px 4px;
             }
             .delim-custom { width: 40px; }
+            .view-btn.active { background: var(--vscode-toolbar-hoverBackground); opacity: 1; }
+            .entry-toolbar {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                padding: 6px 12px;
+                background: var(--vscode-sideBar-background);
+                border-bottom: 1px solid var(--vscode-panel-border);
+                flex-wrap: wrap;
+            }
+            .entry.collapsed .entry-toolbar { display: none; }
+            .piece-search {
+                background: var(--vscode-input-background);
+                color: var(--vscode-input-foreground);
+                border: 1px solid var(--vscode-input-border, transparent);
+                border-radius: 3px;
+                padding: 3px 7px;
+                font-size: 11.5px;
+                flex: 1;
+                min-width: 110px;
+            }
+            .hide-empty-label {
+                display: flex;
+                align-items: center;
+                gap: 4px;
+                font-size: 11.5px;
+                opacity: 0.85;
+                cursor: pointer;
+                white-space: nowrap;
+                user-select: none;
+            }
+            .piece-stats {
+                font-size: 11px;
+                opacity: 0.6;
+                white-space: nowrap;
+                font-family: monospace;
+            }
+            .piece.piece-search-hidden { display: none; }
+            #container.grid-view {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 14px;
+                align-items: flex-start;
+            }
+            #container.grid-view .entry {
+                flex: 1 1 320px;
+                max-width: calc(33.333% - 10px);
+                min-width: 280px;
+                margin-bottom: 0;
+            }
         </style>
     </head>
     <body>
         <div class="toolbar">
             <h3 style="margin:0; font-size: 14px;">Global Viewer</h3>
-            <input id="searchBox" type="text" placeholder="Filter entries...">
+            <input id="searchBox" type="text" placeholder="Filter entries by global name...">
             <div class="toolbar-actions">
                 <button class="btn" title="Expand All" data-action="expandAll">
                     <svg width="16" height="16" viewBox="0 0 16 16"><path fill="currentColor" d="M11 11H5V5h6v6zm3-9H2v12h12V2zM3 13V3h10v10H3z"/></svg>
@@ -463,8 +592,23 @@ function getWebviewContent(cspSource: string) {
                     <svg width="16" height="16" viewBox="0 0 16 16"><path fill="currentColor" d="M9 9H5V5h4v4zm5-7H2v12h12V2zM3 13V3h10v10H3z"/></svg>
                 </button>
                 <div class="v-sep"></div>
-                <button class="btn" style="padding: 4px 10px; font-size: 12px; background: var(--vscode-button-background); color: var(--vscode-button-foreground);" data-action="pinTab">Keep Open</button>
-                <button class="btn" style="padding: 4px 10px; font-size: 12px; background: var(--vscode-button-secondaryBackground);" data-action="clearAll">Clear All</button>
+                <button class="btn view-btn" data-action="viewList" title="List view">
+                    <svg width="16" height="16" viewBox="0 0 16 16"><path fill="currentColor" d="M2 3h12v2H2V3zm0 4h12v2H2V7zm0 4h12v2H2v-2z"/></svg>
+                </button>
+                <button class="btn view-btn" data-action="viewGrid" title="Grid view">
+                    <svg width="16" height="16" viewBox="0 0 16 16"><path fill="currentColor" d="M2 2h5v5H2V2zm7 0h5v5H9V2zM2 9h5v5H2V9zm7 0h5v5H9V9z"/></svg>
+                </button>
+                <div class="v-sep"></div>
+                <button class="btn" title="Move to New Window" data-action="moveToNewWindow">
+                    <svg width="16" height="16" viewBox="0 0 16 16"><path fill="currentColor" d="M9 2h5v5h-1.5V4.56L7.03 10.03 6 9l5.44-5.44H9V2zM3 4h4v1.5H4.5v6h6V9H12v4a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1z"/></svg>
+                </button>
+                <div class="v-sep"></div>
+                <button class="btn" id="pinTabBtn" title="Keep Open (tab is in preview mode)" data-action="pinTab">
+                    <svg width="16" height="16" viewBox="0 0 24 24"><path fill="currentColor" d="M16 12V4h1V2H7v2h1v8l-2 2v2h5.2v6h1.6v-6H18v-2l-2-2z"/></svg>
+                </button>
+                <button class="btn" title="Clear All" data-action="clearAll">
+                    <svg width="16" height="16" viewBox="0 0 16 16"><path fill="currentColor" d="M6 2h4a1 1 0 0 1 1 1v1h3v1.5h-1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1v-9H2V4h3V3a1 1 0 0 1 1-1zm0 2h4V3.5H6V4zM4.5 5.5v9h7v-9h-7zM6.5 7H8v6H6.5V7zm3 0h1.5v6H9.5V7z"/></svg>
+                </button>
             </div>
         </div>
         <div id="container"></div>
@@ -478,14 +622,28 @@ function getWebviewContent(cspSource: string) {
             // value containing HTML-special characters can't inject markup or script.
             let entries = [];
             let searchTerm = '';
+            let viewMode = 'grid'; // 'list' or 'grid' — grid is the default
 
             const prevState = vscode.getState();
             if (prevState && Array.isArray(prevState.entries)) {
                 entries = prevState.entries;
             }
+            if (prevState && (prevState.viewMode === 'list' || prevState.viewMode === 'grid')) {
+                viewMode = prevState.viewMode;
+            }
+            // Older persisted entries won't have these fields yet — default them in.
+            entries.forEach(en => {
+                if (typeof en.pieceSearch !== 'string') en.pieceSearch = '';
+                if (typeof en.hideEmpty !== 'boolean') en.hideEmpty = false;
+            });
 
             function persist() {
-                vscode.setState({ entries });
+                vscode.setState({ entries, viewMode });
+                // Also mirror to the extension host, which keeps its own durable copy (globalState).
+                // The webview's own state above only survives the panel being hidden, not fully
+                // closed — this is what lets closing the Global Viewer tab and then clicking another
+                // global bring back everything that was registered before, instead of starting empty.
+                vscode.postMessage({ command: 'syncState', entries, viewMode });
             }
 
             function splitValue(entry) {
@@ -528,12 +686,31 @@ function getWebviewContent(cspSource: string) {
                 return resultWords.join(' ').split('').reverse().join('');
             }
 
-            function matchesSearch(entry, pieces) {
+            // Top toolbar filter: looks at the global reference alone (e.g. ^["ACC"]LRTAB(1,400,26)),
+            // never the server/namespace shown in blue before it, and never piece contents — that's
+            // what the per-entry piece search below is for.
+            function matchesTopSearch(entry) {
                 if (!searchTerm) return true;
-                const t = searchTerm.toLowerCase();
-                if (entry.server.toLowerCase().includes(t)) return true;
-                if (entry.global.toLowerCase().includes(t)) return true;
-                return pieces.some(p => p.toLowerCase().includes(t));
+                return entry.global.toLowerCase().includes(searchTerm.toLowerCase());
+            }
+
+            // Per-entry piece search matches against whatever is currently on screen for that piece —
+            // the flipped/RTL-processed text when the entry is flipped, the raw text otherwise.
+            function matchesPieceSearch(entry, shownText) {
+                const term = (entry.pieceSearch || '').trim().toLowerCase();
+                if (!term) return true;
+                return shownText.toLowerCase().includes(term);
+            }
+
+            // Splits into pieces by the current delimiter, then (if the entry's "hide empty" toggle
+            // is on) drops empty pieces from the list. The remaining pieces keep their REAL/original
+            // position number (piece 7 stays "7" even if pieces 2-6 are hidden) — hide-empty only
+            // removes rows, it never renumbers what's left.
+            function getDisplayPieces(entry) {
+                const raw = splitValue(entry);
+                let list = raw.map((p, i) => ({ originalIndex: i + 1, raw: p }));
+                if (entry.hideEmpty) list = list.filter(p => p.raw !== '');
+                return { total: raw.length, list };
             }
 
             function copyToClipboard(text, btn) {
@@ -550,12 +727,11 @@ function getWebviewContent(cspSource: string) {
             }
 
             function buildEntryEl(entry) {
-                const pieces = splitValue(entry);
                 const el = document.createElement('div');
                 el.className = 'entry';
                 el.dataset.id = entry.id;
                 if (entry.collapsed) el.classList.add('collapsed');
-                if (!matchesSearch(entry, pieces)) el.classList.add('hidden');
+                if (!matchesTopSearch(entry)) el.classList.add('hidden');
 
                 const header = document.createElement('div');
                 header.className = 'header';
@@ -653,19 +829,77 @@ function getWebviewContent(cspSource: string) {
                     render();
                 });
 
+                // --- Per-entry toolbar: piece search, "hide empty" toggle, piece-count stats.
+                // Lives as its own row (a sibling of .header, not inside it) so clicks in it never
+                // bubble into the header's collapse-toggle handler.
+                const entryToolbar = document.createElement('div');
+                entryToolbar.className = 'entry-toolbar';
+
+                const pieceSearchInput = document.createElement('input');
+                pieceSearchInput.className = 'piece-search';
+                pieceSearchInput.type = 'text';
+                pieceSearchInput.placeholder = 'Search pieces...';
+                pieceSearchInput.value = entry.pieceSearch || '';
+                pieceSearchInput.addEventListener('click', e => e.stopPropagation());
+                pieceSearchInput.addEventListener('input', () => {
+                    entry.pieceSearch = pieceSearchInput.value;
+                    persist();
+                    // Targeted update: rebuilds only this entry's pieces + stats, never this input
+                    // itself, so focus and cursor position survive every keystroke.
+                    updateEntryPieces(entry);
+                });
+                entryToolbar.appendChild(pieceSearchInput);
+
+                const hideEmptyLabel = document.createElement('label');
+                hideEmptyLabel.className = 'hide-empty-label';
+                hideEmptyLabel.addEventListener('click', e => e.stopPropagation());
+                const hideEmptyCheckbox = document.createElement('input');
+                hideEmptyCheckbox.type = 'checkbox';
+                hideEmptyCheckbox.checked = !!entry.hideEmpty;
+                hideEmptyCheckbox.addEventListener('change', () => {
+                    entry.hideEmpty = hideEmptyCheckbox.checked;
+                    persist();
+                    updateEntryPieces(entry);
+                });
+                hideEmptyLabel.appendChild(hideEmptyCheckbox);
+                hideEmptyLabel.appendChild(document.createTextNode('Hide empty'));
+                entryToolbar.appendChild(hideEmptyLabel);
+
+                const statsSpan = document.createElement('span');
+                statsSpan.className = 'piece-stats';
+                entryToolbar.appendChild(statsSpan);
+
                 const content = document.createElement('div');
                 content.className = 'content';
-                pieces.forEach((p, i) => {
-                    const shown = entry.flipped ? WG(p) : p;
+                populatePieces(entry, content, statsSpan);
+
+                el.appendChild(header);
+                el.appendChild(entryToolbar);
+                el.appendChild(content);
+                return el;
+            }
+
+            // Builds the piece rows for one entry into contentEl (and updates statsEl, if given).
+            // Factored out of buildEntryEl so a piece-search keystroke or a "hide empty" toggle can
+            // refresh just this content/stats pair without rebuilding — and stealing focus from —
+            // the rest of the entry (see updateEntryPieces below).
+            function populatePieces(entry, contentEl, statsEl) {
+                contentEl.innerHTML = '';
+                const { total, list } = getDisplayPieces(entry);
+                let shownCount = 0;
+                list.forEach(p => {
+                    const shown = entry.flipped ? WG(p.raw) : p.raw;
+                    const isMatch = matchesPieceSearch(entry, shown);
+                    if (isMatch) shownCount++;
                     const row = document.createElement('div');
-                    row.className = 'piece';
+                    row.className = 'piece' + (isMatch ? '' : ' piece-search-hidden');
                     const num = document.createElement('span');
                     num.className = 'num';
-                    num.textContent = String(i + 1);
+                    num.textContent = String(p.originalIndex);
                     row.appendChild(num);
                     const val = document.createElement('span');
                     val.className = 'piece-val';
-                    if (p === '') {
+                    if (p.raw === '') {
                         const emptyTag = document.createElement('span');
                         emptyTag.className = 'piece-empty';
                         emptyTag.textContent = '[empty]';
@@ -679,17 +913,55 @@ function getWebviewContent(cspSource: string) {
                     copyBtn.textContent = 'Copy';
                     copyBtn.addEventListener('click', () => copyToClipboard(shown, copyBtn));
                     row.appendChild(copyBtn);
-                    content.appendChild(row);
+                    contentEl.appendChild(row);
                 });
-                el.appendChild(header);
-                el.appendChild(content);
-                return el;
+                if (statsEl) {
+                    let text = total + ' piece' + (total === 1 ? '' : 's');
+                    if (shownCount !== total) text += ' \\u00B7 ' + shownCount + ' shown';
+                    statsEl.textContent = text;
+                }
+            }
+
+            function updateEntryPieces(entry) {
+                const entryEl = document.querySelector('.entry[data-id="' + entry.id + '"]');
+                if (!entryEl) return;
+                const contentEl = entryEl.querySelector('.content');
+                const statsEl = entryEl.querySelector('.piece-stats');
+                if (contentEl) populatePieces(entry, contentEl, statsEl);
+            }
+
+            function updateViewButtons() {
+                document.querySelectorAll('.view-btn').forEach(btn => {
+                    const isActive = (btn.dataset.action === 'viewGrid' && viewMode === 'grid')
+                        || (btn.dataset.action === 'viewList' && viewMode === 'list');
+                    btn.classList.toggle('active', isActive);
+                });
             }
 
             function render() {
                 const container = document.getElementById('container');
+                container.className = viewMode === 'grid' ? 'grid-view' : '';
                 container.innerHTML = '';
                 entries.forEach(entry => container.appendChild(buildEntryEl(entry)));
+                updateViewButtons();
+            }
+
+            // Grid view only: keeps whichever cards land in the top row expanded, and collapses
+            // anything pushed into a later row. Row membership is measured from the actual rendered
+            // layout (offsetTop) rather than a hardcoded "3 per row", so it adapts to however many
+            // cards the current window width actually fits (1, 2, or 3). Must be called after a
+            // render() so the cards exist to measure, and is followed by another render() to apply
+            // the resulting collapsed flags. Only ever runs on the two triggers the user asked for —
+            // switching into grid view, and a new global arriving while already in grid view — never
+            // on every render, so it doesn't fight a manual expand/collapse click afterwards.
+            function applyGridAutoCollapse() {
+                if (viewMode !== 'grid') return;
+                const container = document.getElementById('container');
+                const cards = Array.from(container.children).filter(c => c.classList.contains('entry') && !c.classList.contains('hidden'));
+                if (cards.length === 0) return;
+                const firstTop = cards[0].offsetTop;
+                const topRowIds = new Set(cards.filter(c => Math.abs(c.offsetTop - firstTop) < 2).map(c => c.dataset.id));
+                entries.forEach(en => { en.collapsed = !topRowIds.has(en.id); });
             }
 
             document.getElementById('searchBox').addEventListener('input', e => {
@@ -702,31 +974,78 @@ function getWebviewContent(cspSource: string) {
                 if (!action) return;
                 if (action === 'expandAll') { entries.forEach(en => en.collapsed = false); persist(); render(); }
                 if (action === 'collapseAll') { entries.forEach(en => en.collapsed = true); persist(); render(); }
+                if (action === 'viewList') { viewMode = 'list'; persist(); render(); }
+                if (action === 'viewGrid') {
+                    viewMode = 'grid';
+                    render();
+                    applyGridAutoCollapse();
+                    persist();
+                    render();
+                }
+                if (action === 'moveToNewWindow') { vscode.postMessage({ command: 'moveToNewWindow' }); }
                 if (action === 'pinTab') { vscode.postMessage({ command: 'pinTab' }); }
                 if (action === 'clearAll') { entries = []; persist(); render(); }
             });
 
+            function makeEntryFromMessage(message) {
+                return {
+                    id: Date.now() + '-' + Math.random().toString(36).slice(2),
+                    server: message.server,
+                    global: message.global,
+                    value: message.value,
+                    time: message.time,
+                    delimiter: '*',
+                    customDelim: '',
+                    flipped: false,
+                    collapsed: false,
+                    pieceSearch: '',
+                    hideEmpty: false
+                };
+            }
+
             window.addEventListener('message', event => {
                 const message = event.data;
                 if (message.command === 'addEntry') {
-                    entries.forEach(en => en.collapsed = true);
-                    entries.unshift({
-                        id: Date.now() + '-' + Math.random().toString(36).slice(2),
-                        server: message.server,
-                        global: message.global,
-                        value: message.value,
-                        time: message.time,
-                        delimiter: '*',
-                        customDelim: '',
-                        flipped: false,
-                        collapsed: false
+                    if (viewMode === 'grid') {
+                        // List view's "collapse everything else, expand only the new one" doesn't
+                        // apply here — the top row stays expanded, only entries pushed past it
+                        // collapse, per applyGridAutoCollapse().
+                        entries.unshift(makeEntryFromMessage(message));
+                        render();
+                        applyGridAutoCollapse();
+                        persist();
+                        render();
+                    } else {
+                        entries.forEach(en => en.collapsed = true);
+                        entries.unshift(makeEntryFromMessage(message));
+                        persist();
+                        render();
+                    }
+                } else if (message.command === 'initEntries') {
+                    // Sent once, right after this fresh webview announces itself as 'ready' — hydrates
+                    // from the extension-side copy of the last known state, so closing the Global
+                    // Viewer tab and then clicking another global doesn't start from empty and quietly
+                    // discard everything that was registered before.
+                    entries = Array.isArray(message.entries) ? message.entries : [];
+                    entries.forEach(en => {
+                        if (typeof en.pieceSearch !== 'string') en.pieceSearch = '';
+                        if (typeof en.hideEmpty !== 'boolean') en.hideEmpty = false;
                     });
+                    if (message.viewMode === 'grid' || message.viewMode === 'list') viewMode = message.viewMode;
                     persist();
                     render();
+                } else if (message.command === 'previewState') {
+                    // Whatever pinned it — our own auto-keep on open, the manual pin button, or the
+                    // user pinning the tab themselves — there's nothing left to pin once it's not a
+                    // preview tab anymore, so the icon just disappears.
+                    document.getElementById('pinTabBtn').style.display = message.isPreview ? '' : 'none';
                 }
             });
 
             render();
+            // Tells the extension host this fresh webview is ready to receive 'initEntries' (and any
+            // 'addEntry' queued while the panel was still loading) — see showInWebview/wireViewerPanel.
+            vscode.postMessage({ command: 'ready' });
         </script>
     </body>
     </html>`;
