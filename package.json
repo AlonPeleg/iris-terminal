@@ -1,9 +1,9 @@
 {
-  "name": "iris-terminal",
-  "displayName": "iris-terminal",
+  "name": "iris-terminal-bridge",
+  "displayName": "IRIS Terminal Bridge",
   "description": "Auto-SSL Terminal Bridge for InterSystems",
   "publisher": "alonpe",
-  "version": "0.1.15",
+  "version": "0.1.17",
   "engines": {
     "vscode": "^1.108.1"
   },

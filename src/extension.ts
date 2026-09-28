@@ -4,9 +4,9 @@ import * as tls from 'tls';
 
 let viewerPanel: vscode.WebviewPanel | undefined;
 
-type SslMode = 'require' | 'prefer' | 'off';
+export type SslMode = 'require' | 'prefer' | 'off';
 
-interface IrisSession {
+export interface IrisSession {
     terminal?: vscode.Terminal;
     client?: net.Socket | tls.TLSSocket;
     writeEmitter: vscode.EventEmitter<string>;
@@ -37,7 +37,7 @@ interface IrisSession {
 
 // Keep track of live sessions by their owning vscode.Terminal (not by name/title,
 // which changes as the namespace changes and can collide across tabs).
-const sessions = new Map<vscode.Terminal, IrisSession>();
+export const sessions = new Map<vscode.Terminal, IrisSession>();
 
 function getSecretKey(serverId: string, user: string): string {
     return `iris-terminal.password:${serverId}:${user}`;
@@ -206,9 +206,11 @@ export function activate(context: vscode.ExtensionContext) {
 
             // Strip a single pair of wrapping quotes, then unescape doubled quotes ("" -> ").
             valuePart = valuePart.replace(/^"|"$/g, '').replace(/""/g, '"');
-            const pieces = valuePart.split('*');
 
-            showInWebview(terminalName, globalName, pieces, time);
+            // The raw value is sent as-is; the webview splits it by whichever delimiter the
+            // user has selected (default '*'), so the choice can be changed after the fact
+            // without losing data.
+            showInWebview(terminalName, globalName, valuePart, time);
         }
     });
 
@@ -286,46 +288,73 @@ export function activate(context: vscode.ExtensionContext) {
         sessions.delete(terminal);
     });
 
+    registerViewerPanelSerializer(context);
+
     context.subscriptions.push(disposable, linkProvider, pinListener, switchNamespaceDisposable, reconnectDisposable, clearPasswordDisposable, terminalCloseListener);
 }
 
-function showInWebview(server: string, global: string, pieces: string[], time: string) {
+function createViewerPanel(): vscode.WebviewPanel {
+    const panel = vscode.window.createWebviewPanel(
+        'globalViewer',
+        'Global Viewer',
+        vscode.ViewColumn.Two,
+        {
+            enableScripts: true,
+            retainContextWhenHidden: true
+        }
+    );
+    wireViewerPanel(panel);
+    return panel;
+}
+
+function wireViewerPanel(panel: vscode.WebviewPanel) {
+    panel.webview.onDidReceiveMessage(message => {
+        if (message.command === 'pinTab') {
+            vscode.commands.executeCommand('workbench.action.keepEditor');
+        }
+    });
+    panel.onDidDispose(() => { if (viewerPanel === panel) viewerPanel = undefined; });
+    panel.webview.html = getWebviewContent(panel.webview.cspSource);
+}
+
+// Lets VS Code recreate the Global Viewer (with its persisted history intact, via the
+// webview's own getState/setState) after the window reloads or the panel is reopened.
+function registerViewerPanelSerializer(context: vscode.ExtensionContext) {
+    if (!vscode.window.registerWebviewPanelSerializer) return;
+    context.subscriptions.push(
+        vscode.window.registerWebviewPanelSerializer('globalViewer', {
+            deserializeWebviewPanel: async (panel: vscode.WebviewPanel) => {
+                panel.webview.options = { enableScripts: true };
+                viewerPanel = panel;
+                wireViewerPanel(panel);
+            }
+        })
+    );
+}
+
+function showInWebview(server: string, global: string, value: string, time: string) {
     if (!viewerPanel) {
-        viewerPanel = vscode.window.createWebviewPanel(
-            'globalViewer',
-            'Global Viewer',
-            vscode.ViewColumn.Two,
-            {
-                enableScripts: true,
-                retainContextWhenHidden: true
-            }
-        );
-
-        viewerPanel.webview.onDidReceiveMessage(message => {
-            if (message.command === 'pinTab') {
-                vscode.commands.executeCommand('workbench.action.keepEditor');
-            }
-        });
-
-        viewerPanel.onDidDispose(() => { viewerPanel = undefined; });
-        viewerPanel.webview.html = getWebviewContent();
+        viewerPanel = createViewerPanel();
     }
 
     viewerPanel.webview.postMessage({
         command: 'addEntry',
         server,
         global,
-        pieces,
+        value,
         time
     });
     viewerPanel.reveal(vscode.ViewColumn.Two, true);
 }
 
-function getWebviewContent() {
+function getWebviewContent(cspSource: string) {
+    // Random per-load nonce so only this exact inline script may run (CSP script-src).
+    const nonce = require('crypto').randomBytes(16).toString('hex');
     return `<!DOCTYPE html>
     <html lang="en">
     <head>
         <meta charset="UTF-8">
+        <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';">
         <style>
             body {
                 font-family: var(--vscode-editor-font-family);
@@ -344,6 +373,17 @@ function getWebviewContent() {
                 top: 0;
                 background: var(--vscode-editor-background);
                 z-index: 1000;
+                gap: 10px;
+                flex-wrap: wrap;
+            }
+            #searchBox {
+                background: var(--vscode-input-background);
+                color: var(--vscode-input-foreground);
+                border: 1px solid var(--vscode-input-border, transparent);
+                border-radius: 3px;
+                padding: 4px 8px;
+                font-size: 12px;
+                min-width: 160px;
             }
             .entry {
                 border: 1px solid var(--vscode-panel-border);
@@ -353,6 +393,7 @@ function getWebviewContent() {
                 display: flex;
                 flex-direction: column;
             }
+            .entry.hidden { display: none; }
             .header {
                 background: var(--vscode-sideBar-background);
                 padding: 10px 12px;
@@ -366,7 +407,7 @@ function getWebviewContent() {
                 border-bottom: 1px solid var(--vscode-panel-border);
             }
             .header:hover { background: var(--vscode-list-hoverBackground); }
-            .header-text { flex-grow: 1; display: flex; justify-content: space-between; align-items: center; margin-right: 10px; }
+            .header-text { flex-grow: 1; display: flex; justify-content: space-between; align-items: center; margin-right: 10px; gap: 8px; }
             .content {
                 max-height: 400px;
                 overflow-y: auto;
@@ -377,6 +418,7 @@ function getWebviewContent() {
             .entry.collapsed .arrow { transform: rotate(-90deg); }
             .piece {
                 display: flex;
+                align-items: center;
                 gap: 15px;
                 border-bottom: 1px solid var(--vscode-panel-border);
                 padding: 8px 12px;
@@ -384,43 +426,71 @@ function getWebviewContent() {
             }
             .piece:last-child { border-bottom: none; }
             .num { color: var(--vscode-descriptionForeground); font-weight: bold; min-width: 25px; text-align: right; font-family: monospace; opacity: 0.6; }
-            .piece-val { white-space: pre-wrap; word-break: break-all; }
+            .piece-val { white-space: pre-wrap; word-break: break-all; flex: 1; }
+            .piece-empty { opacity: 0.3; }
             .arrow { display: inline-block; width: 10px; transition: transform 0.1s; margin-right: 8px; font-size: 10px; }
             .server-info { font-weight: bold; color: var(--vscode-textLink-foreground); }
             .toolbar-actions { display: flex; gap: 4px; align-items: center; }
             .btn { border: none; padding: 4px; cursor: pointer; border-radius: 3px; display: flex; align-items: center; background: transparent; color: var(--vscode-foreground); }
             .btn:hover { background: var(--vscode-toolbar-hoverBackground); }
-            .btn-flip { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); border: 1px solid #80808066; margin-right: 10px; padding: 2px 8px; font-size: 11px; }
+            .btn-flip { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); border: 1px solid #80808066; padding: 2px 8px; font-size: 11px; }
             .btn-flip.active { background: #007acc; color: white; border-color: transparent; }
+            .btn-copy { opacity: 0.6; font-size: 11px; padding: 2px 6px; border: 1px solid #80808044; }
+            .btn-copy:hover { opacity: 1; }
             .btn-delete { color: var(--vscode-errorForeground); cursor: pointer; font-weight: bold; padding: 0 10px; font-size: 18px; opacity: 0.7; }
             .btn-delete:hover { opacity: 1; }
             .v-sep { border-left: 1px solid var(--vscode-panel-border); height: 16px; margin: 0 8px; }
+            .delim-select, .delim-custom {
+                background: var(--vscode-input-background);
+                color: var(--vscode-input-foreground);
+                border: 1px solid var(--vscode-input-border, transparent);
+                border-radius: 3px;
+                font-size: 11px;
+                padding: 2px 4px;
+            }
+            .delim-custom { width: 40px; }
         </style>
     </head>
     <body>
         <div class="toolbar">
             <h3 style="margin:0; font-size: 14px;">Global Viewer</h3>
+            <input id="searchBox" type="text" placeholder="Filter entries...">
             <div class="toolbar-actions">
-                <button class="btn" title="Expand All" onclick="setAllCollapse(false)">
+                <button class="btn" title="Expand All" data-action="expandAll">
                     <svg width="16" height="16" viewBox="0 0 16 16"><path fill="currentColor" d="M11 11H5V5h6v6zm3-9H2v12h12V2zM3 13V3h10v10H3z"/></svg>
                 </button>
-                <button class="btn" title="Collapse All" onclick="setAllCollapse(true)">
+                <button class="btn" title="Collapse All" data-action="collapseAll">
                     <svg width="16" height="16" viewBox="0 0 16 16"><path fill="currentColor" d="M9 9H5V5h4v4zm5-7H2v12h12V2zM3 13V3h10v10H3z"/></svg>
                 </button>
                 <div class="v-sep"></div>
-                <button class="btn" style="padding: 4px 10px; font-size: 12px; background: var(--vscode-button-background); color: var(--vscode-button-foreground);" onclick="pinTab()">Keep Open</button>
-                <button class="btn" style="padding: 4px 10px; font-size: 12px; background: var(--vscode-button-secondaryBackground);" onclick="clearAll()">Clear All</button>
+                <button class="btn" style="padding: 4px 10px; font-size: 12px; background: var(--vscode-button-background); color: var(--vscode-button-foreground);" data-action="pinTab">Keep Open</button>
+                <button class="btn" style="padding: 4px 10px; font-size: 12px; background: var(--vscode-button-secondaryBackground);" data-action="clearAll">Clear All</button>
             </div>
         </div>
         <div id="container"></div>
-        <script>
+        <script nonce="${nonce}">
             const vscode = acquireVsCodeApi();
             const HEB_RANGE = /[\\u0590-\\u05FF]/;
+            const DELIMS = ['*', '^', '|', '~'];
 
-            function setAllCollapse(shouldCollapse) {
-                document.querySelectorAll('.entry').forEach(e => {
-                    shouldCollapse ? e.classList.add('collapsed') : e.classList.remove('collapsed');
-                });
+            // Single source of truth. Rendering always rebuilds the DOM from this array via
+            // createElement/textContent — never innerHTML with interpolated data — so a global
+            // value containing HTML-special characters can't inject markup or script.
+            let entries = [];
+            let searchTerm = '';
+
+            const prevState = vscode.getState();
+            if (prevState && Array.isArray(prevState.entries)) {
+                entries = prevState.entries;
+            }
+
+            function persist() {
+                vscode.setState({ entries });
+            }
+
+            function splitValue(entry) {
+                const delim = entry.delimiter === 'other' ? (entry.customDelim || '') : entry.delimiter;
+                return delim ? entry.value.split(delim) : [entry.value];
             }
 
             function invpr(t) {
@@ -458,50 +528,205 @@ function getWebviewContent() {
                 return resultWords.join(' ').split('').reverse().join('');
             }
 
-            function toggleFlip(btn) {
-                const entry = btn.closest('.entry');
-                const isNowActive = btn.classList.toggle('active');
-                btn.innerText = isNowActive ? 'Flipped' : 'Original';
-                entry.querySelectorAll('.piece-val').forEach(span => {
-                    const original = span.getAttribute('data-orig');
-                    span.innerText = isNowActive ? WG(original) : original;
-                });
+            function matchesSearch(entry, pieces) {
+                if (!searchTerm) return true;
+                const t = searchTerm.toLowerCase();
+                if (entry.server.toLowerCase().includes(t)) return true;
+                if (entry.global.toLowerCase().includes(t)) return true;
+                return pieces.some(p => p.toLowerCase().includes(t));
             }
+
+            function copyToClipboard(text, btn) {
+                const done = () => {
+                    const original = btn.textContent;
+                    btn.textContent = 'Copied';
+                    setTimeout(() => { btn.textContent = original; }, 900);
+                };
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    navigator.clipboard.writeText(text).then(done, done);
+                } else {
+                    done();
+                }
+            }
+
+            function buildEntryEl(entry) {
+                const pieces = splitValue(entry);
+                const el = document.createElement('div');
+                el.className = 'entry';
+                el.dataset.id = entry.id;
+                if (entry.collapsed) el.classList.add('collapsed');
+                if (!matchesSearch(entry, pieces)) el.classList.add('hidden');
+
+                const header = document.createElement('div');
+                header.className = 'header';
+
+                const arrow = document.createElement('span');
+                arrow.className = 'arrow';
+                arrow.textContent = '\\u25BC';
+                header.appendChild(arrow);
+
+                const headerText = document.createElement('div');
+                headerText.className = 'header-text';
+
+                const left = document.createElement('span');
+                const serverSpan = document.createElement('span');
+                serverSpan.className = 'server-info';
+                serverSpan.textContent = entry.server;
+                left.appendChild(serverSpan);
+                left.appendChild(document.createTextNode(' \\u00BB '));
+                const globalB = document.createElement('b');
+                globalB.textContent = entry.global;
+                left.appendChild(globalB);
+                headerText.appendChild(left);
+
+                const controls = document.createElement('span');
+                controls.style.display = 'flex';
+                controls.style.alignItems = 'center';
+                controls.style.gap = '6px';
+
+                const delimSelect = document.createElement('select');
+                delimSelect.className = 'delim-select';
+                [['*','*'], ['^','^'], ['|','|'], ['~','~'], ['other','Other:']].forEach(([val, label]) => {
+                    const opt = document.createElement('option');
+                    opt.value = val;
+                    opt.textContent = label;
+                    if (entry.delimiter === val) opt.selected = true;
+                    delimSelect.appendChild(opt);
+                });
+                delimSelect.addEventListener('click', e => e.stopPropagation());
+                delimSelect.addEventListener('change', () => {
+                    entry.delimiter = delimSelect.value;
+                    persist();
+                    render();
+                });
+                controls.appendChild(delimSelect);
+
+                if (entry.delimiter === 'other') {
+                    const customInput = document.createElement('input');
+                    customInput.className = 'delim-custom';
+                    customInput.value = entry.customDelim || '';
+                    customInput.placeholder = 'delim';
+                    customInput.addEventListener('click', e => e.stopPropagation());
+                    customInput.addEventListener('change', () => {
+                        entry.customDelim = customInput.value;
+                        persist();
+                        render();
+                    });
+                    controls.appendChild(customInput);
+                }
+
+                const flipBtn = document.createElement('button');
+                flipBtn.className = 'btn btn-flip' + (entry.flipped ? ' active' : '');
+                flipBtn.textContent = entry.flipped ? 'Flipped' : 'Original';
+                flipBtn.addEventListener('click', e => {
+                    e.stopPropagation();
+                    entry.flipped = !entry.flipped;
+                    persist();
+                    render();
+                });
+                controls.appendChild(flipBtn);
+
+                headerText.appendChild(controls);
+                header.appendChild(headerText);
+
+                const timeSpan = document.createElement('span');
+                timeSpan.style.fontSize = '11px';
+                timeSpan.style.opacity = '0.6';
+                timeSpan.style.marginRight = '10px';
+                timeSpan.textContent = entry.time;
+                header.appendChild(timeSpan);
+
+                const delBtn = document.createElement('div');
+                delBtn.className = 'btn-delete';
+                delBtn.textContent = '\\u00D7';
+                delBtn.addEventListener('click', e => {
+                    e.stopPropagation();
+                    entries = entries.filter(en => en.id !== entry.id);
+                    persist();
+                    render();
+                });
+                header.appendChild(delBtn);
+
+                header.addEventListener('click', () => {
+                    entry.collapsed = !entry.collapsed;
+                    persist();
+                    render();
+                });
+
+                const content = document.createElement('div');
+                content.className = 'content';
+                pieces.forEach((p, i) => {
+                    const shown = entry.flipped ? WG(p) : p;
+                    const row = document.createElement('div');
+                    row.className = 'piece';
+                    const num = document.createElement('span');
+                    num.className = 'num';
+                    num.textContent = String(i + 1);
+                    row.appendChild(num);
+                    const val = document.createElement('span');
+                    val.className = 'piece-val';
+                    if (p === '') {
+                        const emptyTag = document.createElement('span');
+                        emptyTag.className = 'piece-empty';
+                        emptyTag.textContent = '[empty]';
+                        val.appendChild(emptyTag);
+                    } else {
+                        val.textContent = shown;
+                    }
+                    row.appendChild(val);
+                    const copyBtn = document.createElement('button');
+                    copyBtn.className = 'btn btn-copy';
+                    copyBtn.textContent = 'Copy';
+                    copyBtn.addEventListener('click', () => copyToClipboard(shown, copyBtn));
+                    row.appendChild(copyBtn);
+                    content.appendChild(row);
+                });
+                el.appendChild(header);
+                el.appendChild(content);
+                return el;
+            }
+
+            function render() {
+                const container = document.getElementById('container');
+                container.innerHTML = '';
+                entries.forEach(entry => container.appendChild(buildEntryEl(entry)));
+            }
+
+            document.getElementById('searchBox').addEventListener('input', e => {
+                searchTerm = e.target.value;
+                render();
+            });
+
+            document.querySelector('.toolbar').addEventListener('click', e => {
+                const action = e.target.closest('[data-action]')?.dataset.action;
+                if (!action) return;
+                if (action === 'expandAll') { entries.forEach(en => en.collapsed = false); persist(); render(); }
+                if (action === 'collapseAll') { entries.forEach(en => en.collapsed = true); persist(); render(); }
+                if (action === 'pinTab') { vscode.postMessage({ command: 'pinTab' }); }
+                if (action === 'clearAll') { entries = []; persist(); render(); }
+            });
 
             window.addEventListener('message', event => {
                 const message = event.data;
                 if (message.command === 'addEntry') {
-                    setAllCollapse(true);
-                    const { server, global, pieces, time } = message;
-                    const container = document.getElementById('container');
-                    const entry = document.createElement('div');
-                    entry.className = 'entry';
-                    const pieceHtml = pieces.map((p, i) => \`
-                        <div class="piece">
-                            <span class="num">\${i+1}</span>
-                            <span class="piece-val" data-orig="\${p}">\${p === "" ? "<span style='opacity:0.3'>[empty]</span>" : p}</span>
-                        </div>\`).join('');
-                    entry.innerHTML = \`
-                        <div class="header" onclick="toggleEntry(this)">
-                            <span class="arrow">▼</span>
-                            <div class="header-text">
-                                <span><span class="server-info">\${server}</span> » <b>\${global}</b></span>
-                                <span>
-                                    <button class="btn btn-flip" onclick="event.stopPropagation(); toggleFlip(this)">Original</button>
-                                </span>
-                            </div>
-                            <span style="font-size: 11px; opacity: 0.6; margin-right: 10px;">\${time}</span>
-                            <div class="btn-delete" onclick="deleteEntry(this, event)">×</div>
-                        </div>
-                        <div class="content">\${pieceHtml}</div>\`;
-                    container.prepend(entry);
+                    entries.forEach(en => en.collapsed = true);
+                    entries.unshift({
+                        id: Date.now() + '-' + Math.random().toString(36).slice(2),
+                        server: message.server,
+                        global: message.global,
+                        value: message.value,
+                        time: message.time,
+                        delimiter: '*',
+                        customDelim: '',
+                        flipped: false,
+                        collapsed: false
+                    });
+                    persist();
+                    render();
                 }
             });
 
-            function pinTab() { vscode.postMessage({ command: 'pinTab' }); }
-            function clearAll() { document.getElementById('container').innerHTML = ''; }
-            function deleteEntry(btn, e) { e.stopPropagation(); btn.closest('.entry').remove(); }
-            function toggleEntry(header) { header.parentElement.classList.toggle('collapsed'); }
+            render();
         </script>
     </body>
     </html>`;
@@ -511,20 +736,20 @@ function getTerminalTitle(serverDisplayName: string, ns: string) {
     return `IRIS: ${serverDisplayName}${ns ? ' - ' + ns : ''}`;
 }
 
-function getSslMode(): SslMode {
+export function getSslMode(): SslMode {
     const mode = vscode.workspace.getConfiguration('iris-terminal').get<string>('sslMode', 'prefer');
     return (mode === 'require' || mode === 'off') ? mode : 'prefer';
 }
 
-function getRejectUnauthorized(): boolean {
+export function getRejectUnauthorized(): boolean {
     return vscode.workspace.getConfiguration('iris-terminal').get<boolean>('tls.rejectUnauthorized', false);
 }
 
-function getTelnetPort(): number {
+export function getTelnetPort(): number {
     return vscode.workspace.getConfiguration('iris-terminal').get<number>('port', 23);
 }
 
-const encodeInput = (data: string, encoding: string): Buffer => {
+export const encodeInput = (data: string, encoding: string): Buffer => {
     if (encoding !== 'windows1255') return Buffer.from(data, 'utf8');
     const bytes: number[] = [];
     for (let i = 0; i < data.length; i++) {
