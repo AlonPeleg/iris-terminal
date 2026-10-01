@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import * as net from 'net';
 import * as tls from 'tls';
+import { Analysis, analyzeSelection, applyAnswers, buildFillParts, classifyAnswer, fillValuesToAnswers, flattenForTerminal, parseIncDefines, Slot } from './sendSelection';
 
 let viewerPanel: vscode.WebviewPanel | undefined;
 // True once the currently-open Global Viewer webview's script has announced itself as 'ready'
@@ -318,20 +319,496 @@ export function activate(context: vscode.ExtensionContext) {
     const viewerTabsListener = vscode.window.tabGroups.onDidChangeTabs(() => updateViewerPinnedState());
 
     context.subscriptions.push(disposable, linkProvider, pinListener, switchNamespaceDisposable, reconnectDisposable, clearPasswordDisposable, terminalCloseListener, viewerTabsListener);
+    context.subscriptions.push(...registerSendSelectionCommands(context));
 }
 
-// Looks up the Global Viewer's own tab (if it's currently open) across all tab groups/windows and
-// tells the webview whether it's still a preview tab, so it can show/hide its pin icon accordingly.
-function updateViewerPinnedState() {
-    if (!viewerPanel) return;
+// ---------------------------------------------------------------------------------------------
+// Send editor selection to an IRIS terminal (with variable / macro substitution)
+// ---------------------------------------------------------------------------------------------
+
+function registerSendSelectionCommands(context: vscode.ExtensionContext): vscode.Disposable[] {
+    return [
+        vscode.commands.registerCommand('iris-terminal.sendSelection', () => sendSelectionToIris(context, false)),
+        vscode.commands.registerCommand('iris-terminal.runSelection', () => sendSelectionToIris(context, true)),
+        vscode.window.registerWebviewViewProvider(FILL_IN_VIEW_ID, new FillInViewProvider(),
+            { webviewOptions: { retainContextWhenHidden: true } })
+    ];
+}
+
+// The IRIS terminal to send to: the only one, or - when several are open - the one picked from a list
+// (the active one is listed first).
+async function pickIrisSession(): Promise<IrisSession | undefined> {
+    const all = [...sessions.values()].filter(s => s.terminal);
+    if (all.length === 0) {
+        const act = await vscode.window.showWarningMessage('IRIS Terminal: no IRIS terminal is open.', 'Open IRIS Terminal');
+        if (act) await vscode.commands.executeCommand('iris-terminal.open');
+        return undefined;
+    }
+
+    let chosen: IrisSession | undefined;
+    if (all.length === 1) {
+        chosen = all[0];
+    } else {
+        const active = vscode.window.activeTerminal;
+        all.sort((a, b) => Number(b.terminal === active) - Number(a.terminal === active));
+        const pick = await vscode.window.showQuickPick(
+            all.map(s => ({
+                label: s.terminal!.name,
+                description: [s.terminal === active ? 'active' : '', (!s.isAlive || !s.client) ? 'disconnected' : ''].filter(Boolean).join(' · '),
+                session: s
+            })),
+            { title: 'Send to which IRIS terminal?', placeHolder: 'Pick the terminal to send the code to' }
+        );
+        chosen = pick?.session;
+    }
+    if (!chosen) return undefined;
+
+    if (!chosen.isAlive || !chosen.client) {
+        vscode.window.showWarningMessage(`IRIS Terminal: "${chosen.terminal?.name}" is disconnected. Reconnect it first (right-click the terminal tab).`);
+        return undefined;
+    }
+    return chosen;
+}
+
+function slotKindLabel(slot: Slot): string {
+    switch (slot.kind) {
+        case 'byref': return 'By-reference argument';
+        case 'macro': return 'Macro';
+        case 'relative': return 'Instance reference (only works inside a class)';
+        default: return 'Variable';
+    }
+}
+
+function validateSlotAnswer(slot: Slot, value: string): vscode.InputBoxValidationMessage | undefined {
+    const info = classifyAnswer(value);
+    if (info.kind === 'empty') return undefined;
+    if (info.kind === 'invalid') {
+        return { message: info.label, severity: vscode.InputBoxValidationSeverity.Warning };
+    }
+    if (info.kind === 'byref' && !slot.argSlot) {
+        return { message: 'By reference — only valid where the original is a bare call argument', severity: vscode.InputBoxValidationSeverity.Warning };
+    }
+    if (slot.kind === 'byref' && info.kind !== 'byref') {
+        return { message: `${info.label} — passed by value (type .name to keep it by reference)`, severity: vscode.InputBoxValidationSeverity.Info };
+    }
+    return { message: info.label, severity: vscode.InputBoxValidationSeverity.Info };
+}
+
+// Simple `#define Name value` macros found in the workspace's .inc files, to prefill the prompt.
+async function findMacroDefinitions(): Promise<Record<string, string>> {
+    const defs: Record<string, string> = {};
+    try {
+        const files = await vscode.workspace.findFiles('**/*.inc', '**/{node_modules,.git}/**', 300);
+        const decoder = new TextDecoder('utf-8');
+        for (const f of files) {
+            try {
+                Object.assign(defs, parseIncDefines(decoder.decode(await vscode.workspace.fs.readFile(f))));
+            } catch { /* unreadable file: skip */ }
+        }
+    } catch { /* no workspace / search failed: no prefill */ }
+    return defs;
+}
+
+// --- Send Selection ---------------------------------------------------------------------------
+
+async function sendSelectionToIris(context: vscode.ExtensionContext, run: boolean) {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor) {
+        vscode.window.showInformationMessage('IRIS Terminal: open a file and select some code first.');
+        return;
+    }
+
+    let text = editor.selections.map(s => editor.document.getText(s)).filter(t => t.trim() !== '').join('\n');
+    if (text.trim() === '') text = editor.document.lineAt(editor.selection.active.line).text;   // no selection: current line
+    if (text.trim() === '') {
+        vscode.window.showInformationMessage('IRIS Terminal: nothing to send.');
+        return;
+    }
+    text = text.replace(/\r\n/g, '\n');
+
+    const session = await pickIrisSession();
+    if (!session) return;
+    const terminalName = session.terminal?.name ?? 'IRIS';
+
+    const cfg = vscode.workspace.getConfiguration('iris-terminal.sendSelection');
+    const analysis = analyzeSelection(text);
+    const wantsMacroLookup = cfg.get<boolean>('lookupMacros', true) &&
+        analysis.slots.some(s => s.kind === 'macro' && !s.text.includes('('));
+    const macroDefs = wantsMacroLookup ? await findMacroDefinitions() : {};
+
+    const prefillFor = (slot: Slot): string =>
+        slot.kind === 'macro' && !slot.text.includes('(') ? (macroDefs[slot.text.slice(3).toLowerCase()] ?? '') : '';
+
+    // No variables: nothing to ask, send right away.
+    if (analysis.slots.length === 0) {
+        await deliverToIris(session, terminalName, flattenForTerminal(applyAnswers(text, analysis, {})), run);
+        return;
+    }
+
+    // Otherwise open the fill-in view. Every field starts empty (= keep the original); only a macro found
+    // in a workspace .inc file starts with its value.
+    const initial: Record<string, string> = {};
+    for (const slot of analysis.slots) {
+        const v = prefillFor(slot);
+        if (v.trim() !== '') initial[slot.key] = v;
+    }
+    await openFillIn(session, terminalName, text, analysis, run, initial);
+}
+
+// Writes the line to the terminal. Returns false if it was not sent (nothing to send, or the session
+// dropped) so a caller can keep its UI open.
+async function deliverToIris(session: IrisSession, terminalName: string, finalText: string,
+    run: boolean, beforeWrite?: () => Promise<void>): Promise<boolean> {
+    if (finalText === '') {
+        vscode.window.showInformationMessage('IRIS Terminal: nothing to send.');
+        return false;
+    }
+
+    // The session may have dropped while the fill-in view was open.
+    if (!session.isAlive || !session.client) {
+        vscode.window.showWarningMessage(`IRIS Terminal: "${terminalName}" disconnected before the text could be sent.`);
+        return false;
+    }
+
+    if (beforeWrite) await beforeWrite();
+
+    // Same path as the keyboard: bytes straight to the server, which echoes them. "Send" stops before
+    // Enter so the line can be reviewed or edited in the terminal; "Send and Run" adds Enter.
+    session.client.write(encodeInput(finalText + (run ? '\r' : ''), session.encoding));
+    session.terminal?.show(false);                // focus the terminal (Send: Enter is one key away; Run: see the output)
+    return true;
+}
+
+// --- the fill-in view: the code with the variables as inline inputs ------------------------------
+// A small tab in the bottom panel (next to Terminal), shown only while it is being used, so it never
+// splits or covers the editor. Opens right after the terminal is chosen.
+
+const FILL_IN_VIEW_ID = 'iris-terminal.fillIn';
+const FILL_IN_CONTEXT_KEY = 'iris-terminal.fillInActive';
+
+interface FillInState {
+    session: IrisSession;
+    terminalName: string;
+    src: string;
+    analysis: Analysis;
+    run: boolean;
+}
+
+let fillInView: vscode.WebviewView | undefined;
+let fillInReady = false;
+let fillInState: FillInState | undefined;
+let fillInBusy = false;
+
+function postFillInLoad(initial: Record<string, string>) {
+    const st = fillInState;
+    if (!st || !fillInView) return;
+    const info: Record<string, string> = {};
+    for (const slot of st.analysis.slots) {
+        const uses = slot.occurrences.length > 1 ? ` (used ${slot.occurrences.length}×)` : '';
+        info[slot.key] = `${slotKindLabel(slot)}${uses}`;
+    }
+    fillInView.webview.postMessage({
+        type: 'load',
+        terminal: st.terminalName,
+        runLabel: st.run ? 'Run' : 'Send',
+        parts: buildFillParts(st.src, st.analysis),
+        info,
+        initial
+    });
+}
+
+let fillInInitial: Record<string, string> = {};
+
+async function openFillIn(session: IrisSession, terminalName: string, src: string, analysis: Analysis, run: boolean,
+    initial: Record<string, string>) {
+    fillInState = { session, terminalName, src, analysis, run };
+    fillInInitial = initial;
+    await vscode.commands.executeCommand('setContext', FILL_IN_CONTEXT_KEY, true);
+    if (fillInView && fillInReady) postFillInLoad(initial);       // else: sent when the view reports it is ready
+    await vscode.commands.executeCommand(`${FILL_IN_VIEW_ID}.focus`);
+}
+
+async function closeFillIn() {
+    fillInState = undefined;
+    fillInInitial = {};
+    fillInView?.webview.postMessage({ type: 'clear' });
+    await vscode.commands.executeCommand('setContext', FILL_IN_CONTEXT_KEY, false);
+}
+
+class FillInViewProvider implements vscode.WebviewViewProvider {
+    resolveWebviewView(view: vscode.WebviewView) {
+        fillInView = view;
+        fillInReady = false;
+        view.webview.options = { enableScripts: true };
+        view.webview.html = fillInHtml(getFillInNonce(), view.webview.cspSource);
+        view.onDidDispose(() => { if (fillInView === view) { fillInView = undefined; fillInReady = false; } });
+
+        view.webview.onDidReceiveMessage(async (msg: any) => {
+            if (msg?.type === 'ready') {
+                fillInReady = true;
+                postFillInLoad(fillInInitial);
+                return;
+            }
+            const st = fillInState;
+            if (!st) return;
+
+            if (msg?.type === 'cancel') {
+                await closeFillIn();
+                await vscode.commands.executeCommand('workbench.action.focusActiveEditorGroup');
+                return;
+            }
+
+            if (msg?.type === 'check') {
+                const slot = st.analysis.slots.find(s => s.key === msg.key);
+                if (!slot) return;
+                const m = validateSlotAnswer(slot, String(msg.value ?? ''));
+                view.webview.postMessage({
+                    type: 'hint', key: msg.key, text: m?.message ?? '',
+                    warn: m?.severity === vscode.InputBoxValidationSeverity.Warning
+                });
+                return;
+            }
+
+            if (msg?.type === 'submit' && !fillInBusy) {
+                fillInBusy = true;
+                try {
+                    const answers = fillValuesToAnswers(st.analysis, msg.values ?? {});
+
+                    const problems: string[] = [];
+                    for (const slot of st.analysis.slots) {
+                        const a = answers[slot.key];
+                        if (!a) continue;
+                        const m = validateSlotAnswer(slot, a);
+                        if (m && m.severity === vscode.InputBoxValidationSeverity.Warning) problems.push(`${slot.text}: ${m.message}`);
+                    }
+                    if (problems.length > 0) {
+                        const pick = await vscode.window.showWarningMessage(`IRIS Terminal: ${problems.join(' · ')}`, 'Send anyway');
+                        if (pick !== 'Send anyway') return;     // stays open so it can be fixed
+                    }
+
+                    const finalText = flattenForTerminal(applyAnswers(st.src, st.analysis, answers));
+                    await deliverToIris(st.session, st.terminalName, finalText, st.run, closeFillIn);
+                } finally {
+                    fillInBusy = false;
+                }
+            }
+        });
+    }
+}
+
+function getFillInNonce(): string {
+    let out = '';
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    for (let i = 0; i < 32; i++) out += chars.charAt(Math.floor(Math.random() * chars.length));
+    return out;
+}
+
+function fillInHtml(nonce: string, cspSource: string): string {
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+    body { margin: 0; padding: 8px 12px; color: var(--vscode-foreground); background: var(--vscode-panel-background, var(--vscode-editor-background)); font-family: var(--vscode-font-family); }
+    .head { font-size: 12px; opacity: .85; margin-bottom: 6px; }
+    .peek {
+        border-top: 1px solid var(--vscode-peekView-border, var(--vscode-focusBorder));
+        border-bottom: 1px solid var(--vscode-peekView-border, var(--vscode-focusBorder));
+        background: var(--vscode-peekViewEditor-background, var(--vscode-editor-background));
+        padding: 8px 10px; overflow: auto; max-height: 60vh;
+    }
+    #code { margin: 0; font-family: var(--vscode-editor-font-family, monospace); font-size: var(--vscode-editor-font-size, 13px);
+            line-height: 1.7; white-space: pre-wrap; word-break: break-word; tab-size: 4; }
+    input {
+        font: inherit; color: var(--vscode-input-foreground); background: var(--vscode-input-background);
+        border: 1px solid var(--vscode-input-border, var(--vscode-focusBorder)); border-radius: 3px;
+        padding: 0 3px; margin: 0 1px; box-sizing: content-box; outline: none; vertical-align: baseline; max-width: 80vw;
+    }
+    input::placeholder { color: var(--vscode-input-placeholderForeground); opacity: 1; }
+    input:focus { border-color: var(--vscode-focusBorder); box-shadow: 0 0 0 1px var(--vscode-focusBorder); }
+    input.mirror { background: transparent; border-style: dashed; cursor: default; }
+    input.bad { border-color: var(--vscode-inputValidation-warningBorder, orange); }
+    .info { min-height: 18px; margin-top: 6px; font-size: 12px; }
+    .info .warn { color: var(--vscode-editorWarning-foreground, orange); }
+    .bar { display: flex; gap: 8px; align-items: center; margin-top: 6px; }
+    button { font: inherit; font-size: 12px; padding: 3px 12px; border: 1px solid transparent; border-radius: 2px; cursor: pointer;
+             color: var(--vscode-button-foreground); background: var(--vscode-button-background); }
+    button:hover { background: var(--vscode-button-hoverBackground); }
+    button.secondary { color: var(--vscode-button-secondaryForeground); background: var(--vscode-button-secondaryBackground); }
+    .keys { margin-left: auto; font-size: 11px; opacity: .65; }
+    .types { margin-top: 6px; font-size: 11px; opacity: .65; font-family: var(--vscode-editor-font-family, monospace); }
+    .empty { opacity: .6; font-size: 12px; }
+</style>
+</head>
+<body>
+<div id="idle" class="empty">Nothing to fill in.</div>
+<div id="main" hidden>
+    <div class="head" id="head"></div>
+    <div class="peek"><pre id="code"></pre></div>
+    <div class="info" id="info"></div>
+    <div class="types">type: 123 &middot; "text" &middot; [1,2] &middot; {"ID":1} &middot; name &middot; .byRef &middot; empty = keep as is</div>
+    <div class="bar">
+        <button id="go"></button>
+        <button id="cancel" class="secondary">Cancel</button>
+        <span class="keys" id="keys"></span>
+    </div>
+</div>
+<script nonce="${nonce}">
+(function () {
+    const vscode = acquireVsCodeApi();
+    const main = document.getElementById('main');
+    const idle = document.getElementById('idle');
+    const code = document.getElementById('code');
+    const info = document.getElementById('info');
+    let byKey = {};          // key -> inputs (the first one is the editable one)
+    let firsts = [];
+    let hints = {};
+    let infoText = {};
+
+    function size(inp) {
+        inp.style.width = (Math.max(inp.value.length, inp.placeholder.length, 1) + 1) + 'ch';
+    }
+    function showInfo(key) {
+        info.textContent = '';
+        const label = document.createElement('span');
+        label.textContent = infoText[key] || '';
+        info.appendChild(label);
+        const h = hints[key];
+        if (h && h.text) {
+            const t = document.createElement('span');
+            t.className = h.warn ? 'warn' : '';
+            t.textContent = '  \\u2014  ' + h.text;
+            info.appendChild(t);
+        }
+    }
+    function submit() {
+        const values = {};
+        for (const key of Object.keys(byKey)) values[key] = byKey[key][0].value;
+        vscode.postMessage({ type: 'submit', values });
+    }
+
+    function render(data) {
+        code.textContent = '';
+        info.textContent = '';
+        byKey = {}; firsts = []; hints = {}; infoText = data.info || {};
+        document.getElementById('head').textContent = data.runLabel + ' to ' + data.terminal + ' \\u2014 fill in the variables';
+        document.getElementById('go').textContent = data.runLabel;
+        document.getElementById('keys').textContent =
+            'Tab / Enter: next \\u00b7 Shift+Tab: back \\u00b7 Enter on the last: ' + data.runLabel.toLowerCase() + ' \\u00b7 Esc: cancel';
+
+        for (const p of data.parts) {
+            if (p.lit !== undefined) { code.appendChild(document.createTextNode(p.lit)); continue; }
+            const inp = document.createElement('input');
+            inp.type = 'text';
+            inp.spellcheck = false;
+            inp.autocomplete = 'off';
+            inp.placeholder = p.text;
+            inp.value = (data.initial && data.initial[p.key]) || '';
+            inp.dataset.key = p.key;
+            (byKey[p.key] = byKey[p.key] || []).push(inp);
+            if (p.first) {
+                firsts.push(inp);
+            } else {
+                inp.classList.add('mirror');
+                inp.readOnly = true;
+                inp.tabIndex = -1;
+                const first = byKey[p.key][0];
+                inp.addEventListener('focus', () => first.focus());
+            }
+            size(inp);
+            code.appendChild(inp);
+        }
+
+        for (const inp of firsts) {
+            const key = inp.dataset.key;
+            inp.addEventListener('focus', () => { inp.select(); showInfo(key); });
+            inp.addEventListener('input', () => {
+                for (const other of byKey[key]) { other.value = inp.value; size(other); }
+                vscode.postMessage({ type: 'check', key, value: inp.value });
+            });
+            inp.addEventListener('keydown', (e) => {
+                const i = firsts.indexOf(inp);
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                    if (i < firsts.length - 1) firsts[i + 1].focus(); else submit();
+                } else if (e.key === 'Escape') {
+                    e.preventDefault();
+                    vscode.postMessage({ type: 'cancel' });
+                }
+            });
+            if (inp.value) vscode.postMessage({ type: 'check', key, value: inp.value });
+        }
+
+        idle.hidden = true;
+        main.hidden = false;
+        if (firsts.length) firsts[0].focus();
+    }
+
+    window.addEventListener('message', (ev) => {
+        const m = ev.data;
+        if (!m) return;
+        if (m.type === 'load') render(m);
+        else if (m.type === 'clear') { main.hidden = true; idle.hidden = false; code.textContent = ''; }
+        else if (m.type === 'hint') {
+            hints[m.key] = m;
+            for (const inp of byKey[m.key] || []) inp.classList.toggle('bad', !!m.warn);
+            const a = document.activeElement;
+            if (a && a.dataset && a.dataset.key === m.key) showInfo(m.key);
+        }
+    });
+
+    document.getElementById('go').addEventListener('click', submit);
+    document.getElementById('cancel').addEventListener('click', () => vscode.postMessage({ type: 'cancel' }));
+    vscode.postMessage({ type: 'ready' });
+})();
+</script>
+</body>
+</html>`;
+}
+
+function sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Finds the Global Viewer's own tab (if it's currently open) across all tab groups/windows.
+// Returns undefined if it can't be found (e.g. the panel was just disposed).
+function findViewerTab(): vscode.Tab | undefined {
     for (const group of vscode.window.tabGroups.all) {
         for (const tab of group.tabs) {
             if (tab.input instanceof vscode.TabInputWebview && tab.input.viewType.includes('globalViewer')) {
-                viewerPanel.webview.postMessage({ command: 'previewState', isPreview: !!tab.isPreview });
-                return;
+                return tab;
             }
         }
     }
+    return undefined;
+}
+
+// Tells the webview whether its tab is still a preview tab, so it can show/hide its pin icon.
+function updateViewerPinnedState() {
+    if (!viewerPanel) return;
+    const tab = findViewerTab();
+    if (tab) viewerPanel.webview.postMessage({ command: 'previewState', isPreview: !!tab.isPreview });
+}
+
+// A brand-new tab opens as a "preview" tab (italic title, silently replaced by the next
+// preview-opened editor) until something explicitly keeps it. `workbench.action.keepEditor` only
+// acts on whatever VS Code currently considers the active editor pane, and `panel.reveal()` gives no
+// promise to await before that registers — so a single fire-and-forget attempt right after reveal
+// can still lose that race. This instead checks the tab's REAL state via the Tabs API after each
+// attempt (rather than hoping one call landed in time) and keeps retrying with backoff until it
+// actually reports not-preview, or it runs out of attempts.
+async function ensureViewerTabKept(terminalToRestore: vscode.Terminal | undefined) {
+    const delaysMs = [0, 80, 250, 600];
+    for (const delay of delaysMs) {
+        if (delay > 0) await sleep(delay);
+        try { await vscode.commands.executeCommand('workbench.action.keepEditor'); } catch { /* command missing on very old VS Code */ }
+        const tab = findViewerTab();
+        if (tab && tab.isPreview === false) break; // confirmed — stop retrying
+    }
+    if (terminalToRestore) terminalToRestore.show(false);
+    updateViewerPinnedState();
 }
 
 function createViewerPanel(): vscode.WebviewPanel {
@@ -353,24 +830,17 @@ function createViewerPanel(): vscode.WebviewPanel {
 function wireViewerPanel(panel: vscode.WebviewPanel) {
     panel.webview.onDidReceiveMessage(message => {
         if (message.command === 'pinTab') {
-            Promise.resolve(vscode.commands.executeCommand('workbench.action.keepEditor')).then(() => updateViewerPinnedState());
+            ensureViewerTabKept(undefined);
         } else if (message.command === 'moveToNewWindow') {
             vscode.commands.executeCommand('workbench.action.moveEditorToNewWindow');
         } else if (message.command === 'ready') {
-            // A brand-new tab opens as a "preview" tab (italic title, silently replaced by the next
-            // preview-opened editor) until something explicitly keeps it. `workbench.action.keepEditor`
-            // only acts on whatever VS Code currently considers the active editor pane — calling it
-            // with preserveFocus still in effect left that ambiguous and the command didn't reliably
-            // land on this panel. So: briefly give the panel real focus (removing all ambiguity about
-            // which editor is "active"), pin it, then hand focus straight back to whatever terminal
-            // the user was in, so nothing visibly changes for them beyond the tab losing its italics.
+            // Briefly give the panel real focus (removing all ambiguity about which editor is
+            // "active" before pinning it), then hand focus straight back to whatever terminal the
+            // user was in, so nothing visibly changes for them beyond the tab losing its italics.
             const terminalToRestore = pendingKeepEditorTerminal;
             pendingKeepEditorTerminal = undefined;
             panel.reveal(panel.viewColumn ?? vscode.ViewColumn.Two, false);
-            Promise.resolve(vscode.commands.executeCommand('workbench.action.keepEditor')).then(() => {
-                if (terminalToRestore) terminalToRestore.show(false);
-                updateViewerPinnedState();
-            });
+            ensureViewerTabKept(terminalToRestore);
             // The fresh webview's script has registered its message listener — safe to hydrate it
             // now. Send the durable snapshot first, then flush anything that tried to arrive while
             // this panel was still loading (see showInWebview).

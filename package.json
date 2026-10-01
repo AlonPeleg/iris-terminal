@@ -3,7 +3,8 @@
   "displayName": "IRIS Terminal Bridge",
   "description": "Auto-SSL Terminal Bridge for InterSystems",
   "publisher": "alonpe",
-  "version": "0.1.21",
+  "version": "0.1.30",
+  "icon": "image/icon.png",
   "engines": {
     "vscode": "^1.108.1"
   },
@@ -30,6 +31,14 @@
       {
         "command": "iris-terminal.clearStoredPassword",
         "title": "IRIS: Clear Stored Password..."
+      },
+      {
+        "command": "iris-terminal.sendSelection",
+        "title": "IRIS: Send Selection to Terminal"
+      },
+      {
+        "command": "iris-terminal.runSelection",
+        "title": "IRIS: Send Selection to Terminal and Run"
       }
     ],
     "keybindings": [
@@ -63,6 +72,18 @@
           "when": "terminalHasBeenCreated",
           "group": "1_modification"
         }
+      ],
+      "editor/context": [
+        {
+          "command": "iris-terminal.sendSelection",
+          "when": "editorHasSelection",
+          "group": "iris-terminal@1"
+        },
+        {
+          "command": "iris-terminal.runSelection",
+          "when": "editorHasSelection",
+          "group": "iris-terminal@2"
+        }
       ]
     },
     "configuration": {
@@ -83,8 +104,32 @@
           "type": "number",
           "default": 23,
           "description": "Telnet/SSL port to connect to on the IRIS/Caché server."
+        },
+        "iris-terminal.sendSelection.lookupMacros": {
+          "type": "boolean",
+          "default": true,
+          "description": "Look up simple '#define Name value' macros in the workspace's .inc files to prefill the prompt for unknown macros."
         }
       }
+    },
+    "viewsContainers": {
+      "panel": [
+        {
+          "id": "iris-terminal-fillin",
+          "title": "IRIS Fill-in",
+          "icon": "$(symbol-variable)"
+        }
+      ]
+    },
+    "views": {
+      "iris-terminal-fillin": [
+        {
+          "type": "webview",
+          "id": "iris-terminal.fillIn",
+          "name": "Fill in variables",
+          "when": "iris-terminal.fillInActive"
+        }
+      ]
     }
   },
   "scripts": {
