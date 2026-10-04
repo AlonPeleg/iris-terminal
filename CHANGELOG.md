@@ -4,6 +4,10 @@ All notable changes to the "iris-terminal" extension will be documented in this 
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.1.38]
+
+- New: Global Watch has a **Highlight changes** switch in the toolbar (on by default, remembered). Turn it off to just see the current data after every refresh: no *new* / *changed* / *removed* marks, no old values, and nodes that disappeared are simply gone.
+
 ## [0.1.37]
 
 - Fix: the **Global Watch** tab could show "An error occurred while loading view: iris-terminal.globalWatch". The tab's page is now built into the extension itself instead of being read from a separate `media` file, and if something else ever stops it from starting, the tab shows the actual reason.

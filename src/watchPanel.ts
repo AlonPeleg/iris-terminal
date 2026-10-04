@@ -47,12 +47,12 @@ interface Conn {
     gen: number;
 }
 
-interface Options { pieces: boolean; delim: string; cdelim: string }
+interface Options { pieces: boolean; delim: string; cdelim: string; compare: boolean }
 
 export class GlobalWatchManager implements vscode.WebviewViewProvider, vscode.Disposable {
     private conns: Conn[] = [];
     private active: number | null = null;
-    private opts: Options = { pieces: false, delim: '*', cdelim: '' };
+    private opts: Options = { pieces: false, delim: '*', cdelim: '', compare: true };
     private nextCid = 1;
     private view?: vscode.WebviewView;
     private visible = false;
@@ -76,7 +76,7 @@ export class GlobalWatchManager implements vscode.WebviewViewProvider, vscode.Di
             }
             this.nextCid = Math.max(saved.nextCid || 1, ...this.conns.map(c => c.id + 1), 1);
             this.active = this.conns.some(c => c.id === saved.active) ? saved.active : (this.conns[0]?.id ?? null);
-            if (saved.opts) this.opts = { pieces: !!saved.opts.pieces, delim: String(saved.opts.delim || '*'), cdelim: String(saved.opts.cdelim || '') };
+            if (saved.opts) this.opts = { pieces: !!saved.opts.pieces, delim: String(saved.opts.delim || '*'), cdelim: String(saved.opts.cdelim || ''), compare: saved.opts.compare !== false };
         }
     }
 
@@ -162,7 +162,8 @@ export class GlobalWatchManager implements vscode.WebviewViewProvider, vscode.Di
                 this.opts = {
                     pieces: !!m.opts?.pieces,
                     delim: ['*', '^', '|', '~', 'other'].includes(m.opts?.delim) ? m.opts.delim : '*',
-                    cdelim: String(m.opts?.cdelim ?? '').slice(0, 8)
+                    cdelim: String(m.opts?.cdelim ?? '').slice(0, 8),
+                    compare: m.opts?.compare !== false
                 };
                 this.persist(); this.pushState(); return;
         }

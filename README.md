@@ -31,6 +31,7 @@ A bottom-panel tab (**IRIS: Open Global Watch**) that watches globals on a serve
 * **Patterns.** `^g` is the whole global. Empty slot = any value, `"text"` or a number = exact. A closing `)` means exactly that level; without it, that level and everything below. `^g()` level 1 only · `^g(,)` level 2 only · `^g("x")` that node only · `^g("x"` that node and everything below · `^g("x",` everything below, not the node · `^g(,,"out")` level 3 where the 3rd subscript is "out". Text subscripts need both quotes.
 * **Nothing is read until you ask.** Press ⟳ or switch **Auto-refresh** on (off by default, every 10 seconds by default; polling pauses while the tab is hidden). Changed, new and removed nodes are highlighted until the next refresh.
 * A global that does not exist (or was killed) is reported and keeps being watched; it appears when it is set again.
+* **Highlight changes** (switch in the toolbar, on by default): marks nodes that are new, changed or removed since the previous refresh. Turn it off to see only the current data on every refresh.
 * Values can be split on `*`, `^`, `|`, `~` or your own delimiter; long JSON values collapse; a watch shows at most 500 nodes at a time (**Show more** loads the next 500).
 * Each connection is an IRIS process (it can use a license seat like a terminal does). **IRIS: Global Watch - Show Last Query** prints the ObjectScript that was typed, if you need to see what runs on the server.
 
