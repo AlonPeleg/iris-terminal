@@ -1,7 +1,8 @@
 import * as vscode from 'vscode';
 import * as net from 'net';
 import * as tls from 'tls';
-import { Analysis, analyzeSelection, applyAnswers, buildFillParts, classifyAnswer, fillValuesToAnswers, flattenForTerminal, parseIncDefines, Slot } from './sendSelection';
+import { registerGlobalWatch } from './watchPanel';
+import { Analysis, analyzeSelection, applyAnswers, buildFillParts, classifyAnswer, fillValuesToAnswers, flattenForTerminal, ObjectChoice, objectExpression, parseClassContext, parseIncDefines, Slot } from './sendSelection';
 
 let viewerPanel: vscode.WebviewPanel | undefined;
 // True once the currently-open Global Viewer webview's script has announced itself as 'ready'
@@ -320,6 +321,9 @@ export function activate(context: vscode.ExtensionContext) {
 
     context.subscriptions.push(disposable, linkProvider, pinListener, switchNamespaceDisposable, reconnectDisposable, clearPasswordDisposable, terminalCloseListener, viewerTabsListener);
     context.subscriptions.push(...registerSendSelectionCommands(context));
+    context.subscriptions.push(...registerGlobalWatch(context, {
+        getSslMode, getRejectUnauthorized, getPort: getTelnetPort, getSecretKey
+    }));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -431,7 +435,10 @@ async function sendSelectionToIris(context: vscode.ExtensionContext, run: boolea
     const terminalName = session.terminal?.name ?? 'IRIS';
 
     const cfg = vscode.workspace.getConfiguration('iris-terminal.sendSelection');
-    const analysis = analyzeSelection(text);
+    // The class the code comes from: lets `..Method(` become `##class(Pkg.Class).Method(` and tells instance methods apart.
+    // (only looked up when the code uses `..` or $this: nothing to translate otherwise)
+    const usesCurrentClass = /\.\.[A-Za-z%]|\$this/i.test(text);
+    const analysis = analyzeSelection(text, usesCurrentClass ? parseClassContext(editor.document.getText()) : undefined);
     const wantsMacroLookup = cfg.get<boolean>('lookupMacros', true) &&
         analysis.slots.some(s => s.kind === 'macro' && !s.text.includes('('));
     const macroDefs = wantsMacroLookup ? await findMacroDefinitions() : {};
@@ -439,8 +446,8 @@ async function sendSelectionToIris(context: vscode.ExtensionContext, run: boolea
     const prefillFor = (slot: Slot): string =>
         slot.kind === 'macro' && !slot.text.includes('(') ? (macroDefs[slot.text.slice(3).toLowerCase()] ?? '') : '';
 
-    // No variables: nothing to ask, send right away.
-    if (analysis.slots.length === 0) {
+    // Nothing to ask (no variables, no object needed): send right away.
+    if (analysis.slots.length === 0 && analysis.objectRefs.length === 0) {
         await deliverToIris(session, terminalName, flattenForTerminal(applyAnswers(text, analysis, {})), run);
         return;
     }
@@ -513,7 +520,12 @@ function postFillInLoad(initial: Record<string, string>) {
         runLabel: st.run ? 'Run' : 'Send',
         parts: buildFillParts(st.src, st.analysis),
         info,
-        initial
+        initial,
+        object: st.analysis.objectRefs.length === 0 ? null : {
+            className: st.analysis.className ?? '',
+            count: st.analysis.objectRefs.length,
+            uses: [...new Set(st.analysis.objectRefs.map(r => r.text))].slice(0, 4)
+        }
     });
 }
 
@@ -574,7 +586,21 @@ class FillInViewProvider implements vscode.WebviewViewProvider {
                 try {
                     const answers = fillValuesToAnswers(st.analysis, msg.values ?? {});
 
+                    // which object the `..Method(` / `..Property` / `$this` uses should run on
+                    let object: ObjectChoice | undefined;
                     const problems: string[] = [];
+                    if (st.analysis.objectRefs.length > 0) {
+                        const mode = msg.object?.mode === 'new' || msg.object?.mode === 'openid' ? msg.object.mode : 'var';
+                        object = { mode, value: String(msg.object?.value ?? '') };
+                        const expr = objectExpression(st.analysis, object);
+                        const uses = [...new Set(st.analysis.objectRefs.map(r => r.text))].slice(0, 3).join(', ');
+                        if (expr === '') {
+                            problems.push(`${uses}: no object given - it will fail at the terminal`);
+                        } else if (mode !== 'new') {
+                            const info = classifyAnswer(object.value);
+                            if (info.kind === 'invalid') problems.push(`object: ${info.label}`);
+                        }
+                    }
                     for (const slot of st.analysis.slots) {
                         const a = answers[slot.key];
                         if (!a) continue;
@@ -586,7 +612,7 @@ class FillInViewProvider implements vscode.WebviewViewProvider {
                         if (pick !== 'Send anyway') return;     // stays open so it can be fixed
                     }
 
-                    const finalText = flattenForTerminal(applyAnswers(st.src, st.analysis, answers));
+                    const finalText = flattenForTerminal(applyAnswers(st.src, st.analysis, answers, object));
                     await deliverToIris(st.session, st.terminalName, finalText, st.run, closeFillIn);
                 } finally {
                     fillInBusy = false;
@@ -611,6 +637,7 @@ function fillInHtml(nonce: string, cspSource: string): string {
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <style>
+    [hidden] { display: none !important; }
     body { margin: 0; padding: 8px 12px; color: var(--vscode-foreground); background: var(--vscode-panel-background, var(--vscode-editor-background)); font-family: var(--vscode-font-family); }
     .head { font-size: 12px; opacity: .85; margin-bottom: 6px; }
     .peek {
@@ -638,6 +665,12 @@ function fillInHtml(nonce: string, cspSource: string): string {
     button:hover { background: var(--vscode-button-hoverBackground); }
     button.secondary { color: var(--vscode-button-secondaryForeground); background: var(--vscode-button-secondaryBackground); }
     .keys { margin-left: auto; font-size: 11px; opacity: .65; }
+    .objrow { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-bottom: 8px; font-size: 12px; }
+    .objrow code, .objrow .static { font-family: var(--vscode-editor-font-family, monospace); }
+    .objrow .static { opacity: .85; }
+    select { font: inherit; color: var(--vscode-dropdown-foreground); background: var(--vscode-dropdown-background);
+             border: 1px solid var(--vscode-dropdown-border, var(--vscode-focusBorder)); border-radius: 2px; padding: 2px 4px; }
+    select:focus { outline: 1px solid var(--vscode-focusBorder); }
     .types { margin-top: 6px; font-size: 11px; opacity: .65; font-family: var(--vscode-editor-font-family, monospace); }
     .empty { opacity: .6; font-size: 12px; }
 </style>
@@ -646,6 +679,17 @@ function fillInHtml(nonce: string, cspSource: string): string {
 <div id="idle" class="empty">Nothing to fill in.</div>
 <div id="main" hidden>
     <div class="head" id="head"></div>
+    <div class="objrow" id="objrow" hidden>
+        <span>Object for <code id="objfor"></code>:</span>
+        <select id="objmode" aria-label="How to get the object">
+            <option value="var">Variable</option>
+            <option value="new">%New</option>
+            <option value="openid">%OpenId</option>
+        </select>
+        <span class="static" id="objpre"></span>
+        <input id="objval" type="text" spellcheck="false" autocomplete="off">
+        <span class="static" id="objpost"></span>
+    </div>
     <div class="peek"><pre id="code"></pre></div>
     <div class="info" id="info"></div>
     <div class="types">type: 123 &middot; "text" &middot; [1,2] &middot; {"ID":1} &middot; name &middot; .byRef &middot; empty = keep as is</div>
@@ -662,6 +706,10 @@ function fillInHtml(nonce: string, cspSource: string): string {
     const idle = document.getElementById('idle');
     const code = document.getElementById('code');
     const info = document.getElementById('info');
+    const objrow = document.getElementById('objrow');
+    const objmode = document.getElementById('objmode');
+    const objval = document.getElementById('objval');
+    let objectData = null;
     let byKey = {};          // key -> inputs (the first one is the editable one)
     let firsts = [];
     let hints = {};
@@ -686,13 +734,83 @@ function fillInHtml(nonce: string, cspSource: string): string {
     function submit() {
         const values = {};
         for (const key of Object.keys(byKey)) values[key] = byKey[key][0].value;
-        vscode.postMessage({ type: 'submit', values });
+        const msg = { type: 'submit', values };
+        if (objectData) msg.object = { mode: objmode.value, value: objmode.value === 'new' ? '' : objval.value };
+        vscode.postMessage(msg);
     }
+
+    // ---- the "Object for ..." row (only when the code uses ..Method( / ..Property / $this on an instance) ----
+    function objFocusables() {
+        const list = [];
+        if (objectData) {
+            list.push(objmode);
+            if (!objval.hidden) list.push(objval);
+        }
+        return list.concat(firsts);
+    }
+    function showObjInfo() {
+        if (!objectData) return;
+        info.textContent = '';
+        const d = objectData;
+        const mode = objmode.value;
+        const t = document.createElement('span');
+        const many = d.count > 1;
+        if (mode === 'var') {
+            const v = objval.value.trim() || 'obj';
+            t.textContent = 'Uses the object in ' + v + ':  ' + v + '.\u2026' + '   (type the variable that holds the object)';
+        } else if (mode === 'new') {
+            t.textContent = many
+                ? 'Created once: set obj=##class(' + d.className + ').%New()  \u2014 then obj.\u2026 (used ' + d.count + '\u00d7)'
+                : '##class(' + d.className + ').%New().\u2026';
+        } else {
+            const id = objval.value.trim() || '\u2026';
+            t.textContent = many
+                ? 'Opened once: set obj=##class(' + d.className + ').%OpenId(' + id + ')  \u2014 then obj.\u2026 (used ' + d.count + '\u00d7)'
+                : '##class(' + d.className + ').%OpenId(' + id + ').\u2026';
+        }
+        info.appendChild(t);
+    }
+    function syncObjMode() {
+        const mode = objmode.value;
+        const d = objectData;
+        objval.hidden = mode === 'new';
+        document.getElementById('objpre').textContent = mode === 'openid' ? '##class(' + d.className + ').%OpenId(' : (mode === 'new' ? '##class(' + d.className + ').%New()' : '');
+        document.getElementById('objpost').textContent = mode === 'openid' ? ')' : '';
+        objval.placeholder = mode === 'openid' ? 'Id' : 'obj';
+        objval.style.width = (mode === 'openid' ? 12 : 14) + 'ch';
+    }
+    function bindObjectRow() {
+        for (const el of [objmode, objval]) {
+            el.addEventListener('focus', () => { if (el === objval) objval.select(); showObjInfo(); });
+            el.addEventListener('keydown', (e) => {
+                const list = objFocusables();
+                const i = list.indexOf(el);
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                    if (i < list.length - 1) list[i + 1].focus(); else submit();
+                } else if (e.key === 'Escape') {
+                    e.preventDefault();
+                    vscode.postMessage({ type: 'cancel' });
+                }
+            });
+        }
+        objmode.addEventListener('change', () => { syncObjMode(); showObjInfo(); if (!objval.hidden) objval.focus(); });
+        objval.addEventListener('input', showObjInfo);
+    }
+    bindObjectRow();
 
     function render(data) {
         code.textContent = '';
         info.textContent = '';
         byKey = {}; firsts = []; hints = {}; infoText = data.info || {};
+        objectData = data.object || null;
+        objrow.hidden = !objectData;
+        if (objectData) {
+            objmode.value = 'var';
+            objval.value = '';
+            document.getElementById('objfor').textContent = objectData.uses.join(', ') + (objectData.count > objectData.uses.length ? ', \u2026' : '');
+            syncObjMode();
+        }
         document.getElementById('head').textContent = data.runLabel + ' to ' + data.terminal + ' \\u2014 fill in the variables';
         document.getElementById('go').textContent = data.runLabel;
         document.getElementById('keys').textContent =
@@ -729,10 +847,11 @@ function fillInHtml(nonce: string, cspSource: string): string {
                 vscode.postMessage({ type: 'check', key, value: inp.value });
             });
             inp.addEventListener('keydown', (e) => {
-                const i = firsts.indexOf(inp);
+                const list = objFocusables();
+                const i = list.indexOf(inp);
                 if (e.key === 'Enter') {
                     e.preventDefault();
-                    if (i < firsts.length - 1) firsts[i + 1].focus(); else submit();
+                    if (i < list.length - 1) list[i + 1].focus(); else submit();
                 } else if (e.key === 'Escape') {
                     e.preventDefault();
                     vscode.postMessage({ type: 'cancel' });
@@ -743,7 +862,8 @@ function fillInHtml(nonce: string, cspSource: string): string {
 
         idle.hidden = true;
         main.hidden = false;
-        if (firsts.length) firsts[0].focus();
+        if (objectData) { objval.focus(); showObjInfo(); }   // the object comes first: type its variable (or pick %New / %OpenId)
+        else if (firsts.length) firsts[0].focus();
     }
 
     window.addEventListener('message', (ev) => {

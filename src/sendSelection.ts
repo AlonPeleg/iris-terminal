@@ -34,8 +34,17 @@ export interface Slot {
 /** A later read of a name that a by-reference argument defines (`.out` ... `out.data`): not asked, renamed along with the argument. */
 export interface Dependent { slotKey: string; start: number; end: number; name: string; }
 
+/** A use of the current object (`..Method(`, `..Property`, `$this`) that needs an instance to run at the terminal. */
+export interface ObjectRef { start: number; end: number; text: string; /** what follows the object: `Method`, `Prop.Sub`, or '' for a bare $this */ rest: string; }
+
+/** What the editor's class file says: its name and which methods are ClassMethods / instance Methods. */
+export interface ClassContext { className: string; classMethods: Set<string>; instanceMethods: Set<string>; }
+
 export interface Analysis {
     slots: Slot[];
+    /** `..Name` / `$this` uses that need an object (only when the class is known) */
+    objectRefs: ObjectRef[];
+    className?: string;
     /** reads of a variable that a by-reference argument fills in; they follow the argument if it is renamed */
     dependents: Dependent[];
     /** universal macros ($$$OK, $$$ISOK, $$$ISERR) translated without asking */
@@ -559,7 +568,7 @@ function splitStatements(toks: Tok[]): Stmt[] {
 // ---------------------------------------------------------------------------------------------
 
 interface RawOcc { start: number; end: number; text: string; kind: SlotKind; callRoot: boolean; }
-interface Ctx { assigned: Set<string>; occs: RawOcc[]; autos: Edit[]; byref: Map<string, string>; deps: Dependent[]; }
+interface Ctx { assigned: Set<string>; occs: RawOcc[]; autos: Edit[]; byref: Map<string, string>; deps: Dependent[]; cls?: ClassContext; objRefs: ObjectRef[]; }
 
 // Depth-aware walk over argument tokens. `[` after an operand is the "contains" operator, not a bracket.
 function scanDepth(a: Tok[], visit: (t: Tok, i: number, depth: number) => void) {
@@ -611,8 +620,82 @@ function findMatching(a: Tok[], openIdx: number): number {
     return -1;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Class context: `..Method(` / `..Property` / `$this`
+// ---------------------------------------------------------------------------------------------
+
+// ClassMethods every persistent / registered class inherits; other %-methods (%Save, %Id, ...) need an instance.
+const PERCENT_CLASS_METHODS = new Set(['%new', '%openid', '%open', '%existsid', '%exists', '%deleteid', '%deleteextent',
+    '%killextent', '%buildindices', '%purgeindices', '%sortbegin', '%sortend', '%buildindices']);
+
+/** Reads the class name and its ClassMethod / Method declarations from the text of a class file. */
+export function parseClassContext(docText: string): ClassContext | undefined {
+    const cm = /^[ \t]*Class[ \t]+([%A-Za-z][A-Za-z0-9_.%]*)/im.exec(docText);
+    if (!cm) return undefined;
+    const classMethods = new Set<string>();
+    const instanceMethods = new Set<string>();
+    const re = /^[ \t]*(ClassMethod|Method)[ \t]+(?:"([^"\r\n]+)"|([%A-Za-z][A-Za-z0-9%]*))/gim;
+    for (let m = re.exec(docText); m; m = re.exec(docText)) {
+        const name = (m[2] ?? m[3]).toLowerCase();
+        (m[1].toLowerCase() === 'classmethod' ? classMethods : instanceMethods).add(name);
+    }
+    return { className: cm[1], classMethods, instanceMethods };
+}
+
+function isClassMethodCall(cls: ClassContext, name: string): boolean {
+    const n = name.toLowerCase();
+    if (cls.classMethods.has(n)) return true;
+    if (cls.instanceMethods.has(n)) return false;
+    if (n.startsWith('%')) return PERCENT_CLASS_METHODS.has(n);
+    return true;                      // not declared here (inherited): assume a class method
+}
+
+// `..Name(` -> `##class(Cls).Name(` for class methods; anything else that needs the current object is
+// recorded, to be replaced once the user says which object to use.
+function relRef(ctx: Ctx, t: Tok, isCall: boolean): boolean {
+    const cls = ctx.cls;
+    if (!cls) return false;
+    if (t.text.startsWith('..')) {
+        const rest = t.text.slice(2);
+        if (isCall && !rest.includes('.') && isClassMethodCall(cls, rest)) {
+            ctx.autos.push({ start: t.start, end: t.end, replacement: `##class(${cls.className}).${rest}` });
+            return true;
+        }
+        ctx.objRefs.push({ start: t.start, end: t.end, text: t.text, rest });
+        return true;
+    }
+    ctx.objRefs.push({ start: t.start, end: t.end, text: t.text, rest: t.text.slice(5).replace(/^\./, '') });   // $this[.x]
+    return true;
+}
+
 function addOcc(ctx: Ctx, tok: Tok, text: string, kind: SlotKind, callRoot = false) {
     ctx.occs.push({ start: tok.start, end: tok.start + text.length, text, kind, callRoot });
+}
+
+// `obj.Method(0).Prop` where every call has only literal arguments (numbers, strings): the whole chain is
+// one value, so it can be replaced as a whole (`5`). Returns the index of its last token, or -1 when some
+// argument is not a literal (the variables inside are asked on their own, so only the object part is).
+function literalChainEnd(a: Tok[], j: number): number {
+    let last = j;
+    for (;;) {
+        let open = last + 1;
+        while (open < a.length && !isSig(a[open])) open++;
+        if (!isP(a[open], '(') || open !== last + 1) break;           // a call must follow directly
+        const close = findMatching(a, open);
+        if (close < 0) return -1;
+        for (let m = open + 1; m < close; m++) {
+            const x = a[m];
+            if (!isSig(x)) continue;
+            const literal = x.type === 'num' || x.type === 'str' || (x.type === 'p' && (x.text === ',' || x.text === '-'));
+            if (!literal) return -1;
+        }
+        last = close;
+        const next = a[last + 1];
+        if (next && next.type === 'skip' && next.text.startsWith('.') && next.start === a[last].end) last++;   // .Member
+        else break;
+        if (!isP(a[last + 1], '(')) break;                            // .Member( -> another call
+    }
+    return last;
 }
 
 function analyzeExpr(a: Tok[], ctx: Ctx, labelFirst = false) {
@@ -627,7 +710,9 @@ function analyzeExpr(a: Tok[], ctx: Ctx, labelFirst = false) {
                 ctx.autos.push({ start: t.start, end: t.end, replacement: AUTO_MACROS[t.text.slice(3).toLowerCase()] });
                 break;
             case 'macro': addOcc(ctx, t, t.text, 'macro'); break;
-            case 'rel': addOcc(ctx, t, t.text, 'relative'); break;
+            case 'rel':
+                if (!relRef(ctx, t, isP(a[j + 1], '('))) addOcc(ctx, t, t.text, 'relative');
+                break;
             case 'byref': {
                 addOcc(ctx, t, t.text, 'byref');
                 // a by-reference argument is (normally) filled in by the call: later reads of that name are not asked
@@ -647,7 +732,13 @@ function analyzeExpr(a: Tok[], ctx: Ctx, labelFirst = false) {
                     break;
                 }
                 if (isCall && parts.length >= 2) {
-                    addOcc(ctx, t, parts.slice(0, -1).join('.'), 'variable', true);   // obj.Method( -> obj
+                    const last = literalChainEnd(a, j);
+                    if (last >= 0) {
+                        // obj.Get(0).ID -> the whole chain is the variable
+                        addOcc(ctx, t, a.slice(j, last + 1).map(x => x.text).join(''), 'variable', true);
+                    } else {
+                        addOcc(ctx, t, parts.slice(0, -1).join('.'), 'variable', true);   // obj.Method( -> obj
+                    }
                 } else {
                     addOcc(ctx, t, parts.join('.'), 'variable');
                 }
@@ -690,6 +781,7 @@ function analyzeTarget(a: Tok[], ctx: Ctx): string[] {
         return names;
     }
     if (t.type === 'rel') {                                  // set ..Prop = x / set $this.Prop = x
+        relRef(ctx, t, false);                               // (needs an object once the class is known)
         analyzeExpr(a.slice(idx + 1), ctx);
         return names;
     }
@@ -751,9 +843,9 @@ function analyzeStatement(s: Stmt, ctx: Ctx) {
     }
 }
 
-export function analyzeSelection(src: string): Analysis {
+export function analyzeSelection(src: string, cls?: ClassContext): Analysis {
     const toks = tokenize(src);
-    const ctx: Ctx = { assigned: new Set<string>(), occs: [], autos: [], byref: new Map<string, string>(), deps: [] };
+    const ctx: Ctx = { assigned: new Set<string>(), occs: [], autos: [], byref: new Map<string, string>(), deps: [], cls, objRefs: [] };
     for (const s of splitStatements(toks)) analyzeStatement(s, ctx);
 
     // compute "is this a bare call argument" from the neighbouring significant tokens
@@ -786,7 +878,8 @@ export function analyzeSelection(src: string): Analysis {
         slot.occurrences.push(occ);
         if (argSlot) slot.argSlot = true;
     }
-    return { slots, autoEdits: ctx.autos, dependents: ctx.deps };
+    ctx.objRefs.sort((a, b) => a.start - b.start);
+    return { slots, autoEdits: ctx.autos, dependents: ctx.deps, objectRefs: ctx.objRefs, className: cls?.className };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -911,8 +1004,49 @@ export function formatReplacement(answer: string): string {
     return classifyAnswer(a).kind === 'expression' ? `(${a})` : a;
 }
 
-export function applyAnswers(src: string, analysis: Analysis, answers: Record<string, string>): string {
+export type ObjectMode = 'var' | 'new' | 'openid';
+
+/** The user's choice for the current object: a variable (or expression), a new instance, or an instance opened by id. */
+export interface ObjectChoice { mode: ObjectMode; value: string; }
+
+/** The expression for the object, or '' when none was given (the `..` uses are then left as they are). */
+export function objectExpression(analysis: Analysis, choice?: ObjectChoice): string {
+    if (!choice) return '';
+    const v = choice.value.trim();
+    if (choice.mode === 'var') return v;
+    if (!analysis.className) return '';
+    if (choice.mode === 'new') return `##class(${analysis.className}).%New()`;
+    return v === '' ? '' : `##class(${analysis.className}).%OpenId(${v})`;
+}
+
+// Edits that point the `..` / $this uses at the object. A plain variable is substituted directly; a
+// created / opened object (or any other expression) is created once up front when it is used more than
+// once, so every use sees the same object.
+function objectEdits(src: string, analysis: Analysis, choice?: ObjectChoice): { edits: Edit[]; prefix: string } {
+    const expr = objectExpression(analysis, choice);
+    if (expr === '' || analysis.objectRefs.length === 0) return { edits: [], prefix: '' };
+
+    const plain = VARIABLE_RE.test(expr) && !expr.startsWith('..');
+    const inline = plain || analysis.objectRefs.length === 1 && expr.startsWith('##class(');
+    let target = expr;
+    let prefix = '';
+    if (!inline) {
+        const used = new Set((src.match(/[A-Za-z%][A-Za-z0-9%]*/g) ?? []).map(w => w.toLowerCase()));
+        let name = 'obj';
+        for (let i = 1; used.has(name); i++) name = `obj${i}`;
+        target = name;
+        prefix = `set ${name}=${expr}\n`;
+    }
+    const edits = analysis.objectRefs.map(r => ({
+        start: r.start, end: r.end, replacement: r.rest === '' ? target : `${target}.${r.rest}`
+    }));
+    return { edits, prefix };
+}
+
+export function applyAnswers(src: string, analysis: Analysis, answers: Record<string, string>, object?: ObjectChoice): string {
     const edits: Edit[] = analysis.autoEdits.slice();
+    const obj = objectEdits(src, analysis, object);
+    edits.push(...obj.edits);
     for (const slot of analysis.slots) {
         const raw = answers[slot.key];
         if (raw === undefined || raw.trim() === '') continue;     // empty = keep the original text
@@ -929,7 +1063,7 @@ export function applyAnswers(src: string, analysis: Analysis, answers: Record<st
     edits.sort((x, y) => y.start - x.start);
     let out = src;
     for (const e of edits) out = out.slice(0, e.start) + e.replacement + out.slice(e.end);
-    return out;
+    return obj.prefix + out;
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -14,3 +14,5 @@ vsc-extension-quickstart.png
 **/.vscode-test.*
 package-lock.json
 yarn.lock
+scripts/**
+media/**

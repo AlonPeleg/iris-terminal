@@ -24,6 +24,16 @@ An advanced **Auto-SSL Terminal Bridge** for InterSystems IRIS and Caché. This 
 * **Auto-Pin (`isfs`)**: Forcefully pins server-side files to your tab bar, preventing "Preview Mode" from closing your work while you navigate.
 * **Persistent Sessions**: Retains webview context even when hidden, so your global history isn't lost during your session.
 
+### 👁️ Global Watch
+A bottom-panel tab (**IRIS: Open Global Watch**) that watches globals on a server without a visible terminal.
+
+* **One tab per server.** `+ Connect to server` picks a server and encoding and opens a hidden connection to it; the ✕ on its tab or the plug button disconnects. Namespaces are read from the server and chosen per watch.
+* **Patterns.** `^g` is the whole global. Empty slot = any value, `"text"` or a number = exact. A closing `)` means exactly that level; without it, that level and everything below. `^g()` level 1 only · `^g(,)` level 2 only · `^g("x")` that node only · `^g("x"` that node and everything below · `^g("x",` everything below, not the node · `^g(,,"out")` level 3 where the 3rd subscript is "out". Text subscripts need both quotes.
+* **Nothing is read until you ask.** Press ⟳ or switch **Auto-refresh** on (off by default, every 10 seconds by default; polling pauses while the tab is hidden). Changed, new and removed nodes are highlighted until the next refresh.
+* A global that does not exist (or was killed) is reported and keeps being watched; it appears when it is set again.
+* Values can be split on `*`, `^`, `|`, `~` or your own delimiter; long JSON values collapse; a watch shows at most 500 nodes at a time (**Show more** loads the next 500).
+* Each connection is an IRIS process (it can use a license seat like a terminal does). **IRIS: Global Watch - Show Last Query** prints the ObjectScript that was typed, if you need to see what runs on the server.
+
 ### ⌨️ Send Selection to Terminal
 Select code in any editor, right-click, and choose one of:
 
@@ -60,6 +70,8 @@ set status=$zaccessor.Customer.tableSearch(search,.outSearch)
 ```
 `search` → `{"ID":1}`, `.outSearch` → *(empty)* gives `set status=$zaccessor.Customer.tableSearch({"ID":1},.outSearch)`.
 
+* A chain with method calls, like `outSearch.data.%Get(0).ID`, is one field as a whole when the calls only have literal arguments, so you can type the final value (`55`). To use an object instead, type it together with the call (`[{"ID":5}].%Get(0).ID`). If a call's arguments contain variables (`obj.Method(arg)`), only the object part is asked, and the arguments are asked on their own.
+* **`..Method(`, `..Property`, `$this`** (code selected from a class): the class name is read from the file. `..ClassMethod(` becomes `##class(Pkg.Class).ClassMethod(` automatically. Instance methods, properties and `$this` need an object, so an **Object** row appears above the code: pick *Variable* and type the variable that holds the object (`obj` → `obj.Method(`), or *%New* (`##class(Pkg.Class).%New()`), or *%OpenId* (`##class(Pkg.Class).%OpenId(<id>)`, type the id). When the object is used several times it is created or opened once, up front, so every use shares it.
 * A by-reference argument such as `.outSearch` is treated as filled in by the call, so later uses (`outSearch.data`) are not asked. If you type `.B` for it, those later uses are renamed to `B` too.
 * Command abbreviations (`s`, `k`, `d`, `f`, …) are understood. Assignment targets (`set x=`, `for i=`, `new`, `kill`, `catch ex`) are not asked for.
 * A compound answer such as `3+1` is wrapped in parentheses, because ObjectScript evaluates strictly left to right.
