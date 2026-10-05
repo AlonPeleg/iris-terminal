@@ -3,7 +3,7 @@
   "displayName": "IRIS Terminal Bridge",
   "description": "Auto-SSL Terminal Bridge for InterSystems",
   "publisher": "alonpe",
-  "version": "0.1.38",
+  "version": "0.1.42",
   "icon": "image/icon.png",
   "engines": {
     "vscode": "^1.95.0"
@@ -36,6 +36,10 @@
         "command": "iris-terminal.openGlobalWatch",
         "title": "IRIS: Open Global Watch",
         "icon": "$(eye)"
+      },
+      {
+        "command": "iris-terminal.sendToGlobalWatch",
+        "title": "IRIS: Send to Global Watch"
       },
       {
         "command": "iris-terminal.globalWatchShowQuery",
@@ -92,6 +96,11 @@
           "command": "iris-terminal.runSelection",
           "when": "editorHasSelection",
           "group": "iris-terminal@2"
+        },
+        {
+          "command": "iris-terminal.sendToGlobalWatch",
+          "when": "editorLangId =~ /objectscript/ || resourceScheme =~ /^isfs/",
+          "group": "iris-terminal@3"
         }
       ]
     },

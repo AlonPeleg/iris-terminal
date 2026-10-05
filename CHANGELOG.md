@@ -4,6 +4,32 @@ All notable changes to the "iris-terminal" extension will be documented in this 
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.1.42]
+
+- Fix: **Send to Global Watch** with only the global's name selected (a double-click) sent the whole reference with its subscripts. Now what you select is what you get: `mtempTest` -> `^mtempTest`, `mtempTest(` -> `^mtempTest(`, `^g("a","b",` -> `^g("a","b",`. With nothing selected (just the cursor in the reference) it still sends the whole reference.
+
+## [0.1.41]
+
+- Change: the Global Watch filter syntax help is no longer printed under the field; a **?** button next to *Add watch* opens it as a popover (click elsewhere or press Esc to close). The field itself stays as simple as before.
+- Change: **Send to Global Watch** with only the first part of a reference selected (from `^` or the name to somewhere inside the subscripts) now sends just that part: selecting `^g("a","b",` sends `^g("a","b",` (everything below that node). Cursor only or the whole reference selected send the whole reference (selecting just the name changed in 0.1.42).
+
+## [0.1.40]
+
+- New: **filters on subscripts in Global Watch patterns.** Per slot: `2:5` / `:5` / `2:` (number range), `>2 >=2 <5 <=5`, `["out` (contains), `'["out` (does not contain), `"ab"*` (starts with), `]"abc"` (sorts after), `'="x"` (is not), `?3N` (ObjectScript pattern match) and lists `{"abc","bbb",7,2:5}`. Example: `^mtempTest(2:5,,["out"`. The field describes the pattern in words while you type.
+  - Filtered watches stop after scanning 200,000 subscripts and say so in the watch.
+- New: a namespace can lead the reference: `^["ACC"]g(...)` or `^|"ACC"|g(...)`. Pasting one into the field selects that namespace in the dropdown.
+- New: **IRIS: Send to Global Watch** (right-click in an ObjectScript editor). Finds the global under the cursor / in the selection (adds `^` to a double-clicked bare name, ignores `label^routine`, `$$^routine`, `do ^routine`), takes the editor's server and namespace (`isfs://server:NS/...` or `objectscript.conn`), opens Global Watch on that server's tab (connecting if needed), selects the namespace and puts the global in the field. It does not add the watch or read anything.
+- Build: the pattern parser is one source (`src/patternSyntax.ts`) used by the extension and, transpiled by `scripts/embed-media.js`, by the Global Watch page.
+
+## [0.1.39]
+
+- New: **Global Viewer redesigned** (fixes the grid-view cards whose delimiter dropdown, Original/Flipped button, time and x spilled outside the card). Entries now live in a sidebar with one wide detail pane next to it, so nothing can overflow.
+  - The sidebar has a **Tree | List** switch: Tree groups by server > global > subscripts (with expand / collapse all), List is flat, newest first. The choice, the selected entry, the pinned entry and which branches are open are remembered.
+  - **Pin to compare**: pin an entry, select another and see them side by side with differing pieces highlighted (a new Ctrl+Click capture is compared with the pinned one straight away).
+  - Clicking the same global again keeps each capture (shown by time), so you can see how it changed.
+  - The old List / Grid / Expand all / Collapse all buttons are gone; everything else (delimiter, Original/Flipped, piece search, Hide empty, Copy, Move to new window, Keep open, Clear all) is still there, now per entry in the detail pane. Colours follow your VS Code theme.
+- Build: the viewer page is `media/globalViewer.html`, embedded at compile time into `src/globalViewerHtml.ts` (same as Global Watch).
+
 ## [0.1.38]
 
 - New: Global Watch has a **Highlight changes** switch in the toolbar (on by default, remembered). Turn it off to just see the current data after every refresh: no *new* / *changed* / *removed* marks, no old values, and nodes that disappeared are simply gone.

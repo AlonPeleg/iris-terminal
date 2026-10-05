@@ -17,7 +17,9 @@ An advanced **Auto-SSL Terminal Bridge** for InterSystems IRIS and Caché. This 
 
 ### 🔍 Interactive Global Viewer
 * **Terminal Link Provider**: High-speed regex detection for Global references in your terminal. `Ctrl+Click` any global line to inspect it.
-* **Piece Explorer**: Automatically splits global data by the `*` delimiter into a structured list.
+* **Sidebar + detail layout**: every global you `Ctrl+Click` is added to a sidebar with the full value and its pieces in a wide pane next to it. Switch the sidebar between **Tree** (server > global > subscripts, with expand / collapse all) and a flat **List** (newest first). Click the same global again later and it is kept as another capture, so you can compare how it changed.
+* **Pin to compare**: pin one entry, select another (or click a new global) and the two are shown side by side with the differing pieces highlighted.
+* **Piece Explorer**: Splits global data by `*` (or `^`, `|`, `~`, or any delimiter you type) into numbered pieces, with per-entry piece search, *Hide empty* and a *Copy* button per piece. Up / Down arrows move through the sidebar.
 * **BiDi / Hebrew "Flip"**: Specialized logic to handle "Visual Hebrew" (reversed text) often found in legacy Caché systems. Includes smart character swapping for parentheses and brackets.
 
 ### 📌 Productivity Tweaks
@@ -29,6 +31,17 @@ A bottom-panel tab (**IRIS: Open Global Watch**) that watches globals on a serve
 
 * **One tab per server.** `+ Connect to server` picks a server and encoding and opens a hidden connection to it; the ✕ on its tab or the plug button disconnects. Namespaces are read from the server and chosen per watch.
 * **Patterns.** `^g` is the whole global. Empty slot = any value, `"text"` or a number = exact. A closing `)` means exactly that level; without it, that level and everything below. `^g()` level 1 only · `^g(,)` level 2 only · `^g("x")` that node only · `^g("x"` that node and everything below · `^g("x",` everything below, not the node · `^g(,,"out")` level 3 where the 3rd subscript is "out". Text subscripts need both quotes.
+* **Filters on subscripts.** Each slot can hold more than a value (the field describes your pattern in words as you type; the **?** button next to Add watch lists everything):
+  * `2:5`, `:5`, `2:` number from … to … (both ends included) · `>2` `>=2` `<5` `<=5`
+  * `["out"` contains · `'["out"` does not contain · `"ab"*` starts with · `]"abc"` sorts after · `'="x"` is not · `?3N` ObjectScript pattern match (`'?3N` no match)
+  * `{"abc","bbb",7,2:5}` any one of the listed values / ranges / prefixes (up to 100)
+  * Example: `^mtempTest(2:5,,["out"` = 1st subscript from 2 to 5 and 3rd contains "out", at level 3 and below. `^mtempTest({"abc","bbb"},)` = everything below `^mtempTest("abc")` and `^mtempTest("bbb")`.
+  * Filters are applied on the server and ranges / prefixes / exact lists skip straight to the matching subscripts; a contains / pattern filter has to look at every subscript at that level, so a watch stops after scanning 200,000 subscripts and says so (narrow it with a range, prefix or exact value on an earlier subscript).
+* **Namespace in the reference.** `^["ACC"]g(...)` (or `^|"ACC"|g(...)`) uses that namespace; pasting one into the field selects the namespace in the dropdown and keeps just `^g(...)`.
+* **Send to Global Watch from the editor.** Right-click in an ObjectScript editor (or run **IRIS: Send to Global Watch**) with the cursor inside a global reference, or with a global name selected (a double-click selects `mtempTest` without the `^`; the `^` is added, never doubled). Global Watch opens on that editor's server (`isfs://server:NS/…` or the workspace's `objectscript.conn`), connects if needed, selects the namespace and puts the reference in the global field with the cursor there. **Nothing is added or read**: edit the subscripts / filters, press Enter to add, ⟳ to read.
+  * Subscripts that are plain literals are kept (`^mtempTest(1,"abc")`); variables and expressions become empty slots (`^mtempTest(id,"abc")` → `^mtempTest(,"abc")`). With just the cursor in it (nothing selected) the whole reference is copied as written, so a closing `)` means that level only - delete it to also see everything below. **What you select is what you get**, as long as the selection starts at the `^` or the name: selecting just `mtempTest` sends `^mtempTest` (the global), `mtempTest(` sends `^mtempTest(`, and `^g("a","b",` sends `^g("a","b",` (everything below that node, not the node itself). A selection that is only part of the name, or only inside the subscripts, falls back to the whole reference.
+  * Routine calls are recognised and refused: `label^routine`, `$$^routine`, `$$label^routine`, `do ^routine`, `goto ^routine`, `$text(^routine)`. `^||x` (process-private) cannot be watched from another connection. An explicit namespace in the reference (`^["ACC"]x`) wins over the editor's namespace.
+  * No default shortcut is assigned; bind **IRIS: Send to Global Watch** in Keyboard Shortcuts if you want one.
 * **Nothing is read until you ask.** Press ⟳ or switch **Auto-refresh** on (off by default, every 10 seconds by default; polling pauses while the tab is hidden). Changed, new and removed nodes are highlighted until the next refresh.
 * A global that does not exist (or was killed) is reported and keeps being watched; it appears when it is set again.
 * **Highlight changes** (switch in the toolbar, on by default): marks nodes that are new, changed or removed since the previous refresh. Turn it off to see only the current data on every refresh.

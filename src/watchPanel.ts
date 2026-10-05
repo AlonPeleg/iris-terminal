@@ -2,7 +2,9 @@
 // the auto-refresh timers and the messages to / from the webview (media/globalWatch.html).
 
 import * as vscode from 'vscode';
-import { NS_RE, parsePattern, QueryResult } from './globalWatch';
+import { NS_RE, parsePattern, splitNamespace, QueryResult } from './globalWatch';
+import { findGlobalReference } from './globalRef';
+import { resolveEditorServer, ObjectScriptConn } from './editorServer';
 import { WatchClient, WatchSslMode } from './watchClient';
 import { GLOBAL_WATCH_HTML } from './globalWatchHtml';
 
@@ -57,6 +59,8 @@ export class GlobalWatchManager implements vscode.WebviewViewProvider, vscode.Di
     private view?: vscode.WebviewView;
     private visible = false;
     private output?: vscode.OutputChannel;
+    private webReady = false;
+    private pendingPrefill?: { cid: number; ns: string; text: string };
 
     constructor(private readonly ctx: vscode.ExtensionContext, private readonly deps: WatchDeps) {
         const saved = ctx.globalState.get<any>(STATE_KEY);
@@ -84,12 +88,13 @@ export class GlobalWatchManager implements vscode.WebviewViewProvider, vscode.Di
 
     resolveWebviewView(view: vscode.WebviewView) {
         this.view = view;
+        this.webReady = false;
         this.visible = view.visible;
         view.webview.options = { enableScripts: true, localResourceRoots: [this.ctx.extensionUri] };
         try {
             const nonce = makeNonce();
             view.webview.html = GLOBAL_WATCH_HTML.split('{{NONCE}}').join(nonce).split('{{CSP}}').join(view.webview.cspSource);
-            view.onDidDispose(() => { if (this.view === view) { this.view = undefined; this.visible = false; this.pauseTimers(); } });
+            view.onDidDispose(() => { if (this.view === view) { this.view = undefined; this.webReady = false; this.visible = false; this.pauseTimers(); } });
             view.onDidChangeVisibility(() => this.onVisibility(view.visible));
             view.webview.onDidReceiveMessage((m: any) => { void this.onMessage(m); });
         } catch (e: any) {
@@ -156,7 +161,11 @@ export class GlobalWatchManager implements vscode.WebviewViewProvider, vscode.Di
     private async onMessage(m: any) {
         if (!m || typeof m.type !== 'string') return;
         switch (m.type) {
-            case 'ready': this.pushState(); return;
+            case 'ready':
+                this.webReady = true;
+                this.pushState();
+                if (this.pendingPrefill) { const p = this.pendingPrefill; this.pendingPrefill = undefined; this.post({ type: 'prefill', ...p }); }
+                return;
             case 'connect': await this.addConnection(); return;
             case 'options':
                 this.opts = {
@@ -214,9 +223,17 @@ export class GlobalWatchManager implements vscode.WebviewViewProvider, vscode.Di
         const fail = (error: string) => this.post({ type: 'addError', cid: c.id, error, text: patText });
         const r = parsePattern(pat);
         if (!r.ok) return fail(r.error);
+        let pattern = pat;
+        if (r.pattern.namespace !== undefined) {
+            // ^["ACC"]g(...) names its own namespace: that wins over the dropdown, and only ^g(...) is stored
+            ns = r.pattern.namespace;
+            pattern = splitNamespace(pat).text;
+            const known = c.nsList?.find(n => n.toUpperCase() === ns.toUpperCase());
+            if (known) ns = known;
+        }
         if (!NS_RE.test(ns)) return fail(`"${ns}" is not a valid namespace name`);
-        if (c.watches.some(w => w.ns.toUpperCase() === ns.toUpperCase() && w.pat === pat)) return fail('That namespace and pattern are already watched');
-        c.watches.push({ id: c.nextWid++, ns, pat, on: true, open: true, limit: PAGE });
+        if (c.watches.some(w => w.ns.toUpperCase() === ns.toUpperCase() && w.pat === pattern)) return fail('That namespace and pattern are already watched');
+        c.watches.push({ id: c.nextWid++, ns, pat: pattern, on: true, open: true, limit: PAGE });
         this.persist();
         this.pushState();
     }
@@ -272,6 +289,18 @@ export class GlobalWatchManager implements vscode.WebviewViewProvider, vscode.Di
         const entry = list[serverId];
         const label = sel.label.replace('$(server) ', '');
 
+        const encoding = await this.askEncoding(serverId);
+        if (!encoding) return undefined;
+
+        let host: string = entry?.webServer?.host || entry?.host || '';
+        if (!host) {
+            host = (await vscode.window.showInputBox({ prompt: `Host of ${serverId}`, ignoreFocusOut: true })) || '';
+            if (!host) return undefined;
+        }
+        return { serverId, label, host, encoding };
+    }
+
+    private async askEncoding(serverId: string): Promise<string | undefined> {
         const last = this.ctx.globalState.get<string>(ENCODING_KEY + serverId);
         const encItems = [
             { label: 'Hebrew (Windows-1255)', description: 'Cache servers', detail: 'windows1255' },
@@ -281,13 +310,95 @@ export class GlobalWatchManager implements vscode.WebviewViewProvider, vscode.Di
         const enc = await vscode.window.showQuickPick(encItems, { placeHolder: `Select encoding for ${serverId}` });
         if (!enc) return undefined;
         await this.ctx.globalState.update(ENCODING_KEY + serverId, enc.detail);
+        return enc.detail;
+    }
 
+    /** The server tab for serverId: the existing one, or a new (not yet connected) one. Undefined if the user backs out. */
+    private async ensureConnection(serverId: string): Promise<Conn | undefined> {
+        let c = this.conns.find(x => x.serverId.toLowerCase() === serverId.toLowerCase());
+        if (c) return c;
+        const entry = this.serverEntry(serverId);
+        const display = entry?.description && String(entry.description).trim() !== '' ? String(entry.description) : serverId;
+        let encoding = this.ctx.globalState.get<string>(ENCODING_KEY + serverId);
+        if (encoding !== 'utf8' && encoding !== 'windows1255') {
+            encoding = await this.askEncoding(serverId);
+            if (!encoding) return undefined;
+        }
         let host: string = entry?.webServer?.host || entry?.host || '';
         if (!host) {
             host = (await vscode.window.showInputBox({ prompt: `Host of ${serverId}`, ignoreFocusOut: true })) || '';
             if (!host) return undefined;
         }
-        return { serverId, label, host, encoding: enc.detail };
+        c = {
+            id: this.nextCid++, serverId, label: display, host, user: '', encoding,
+            watches: [], secs: 10, nextWid: 1, auto: false, status: 'disconnected', defNs: '', refreshing: false,
+            pass: '', passSource: 'none', gen: 0
+        };
+        this.conns.push(c);
+        this.persist();
+        return c;
+    }
+
+    // ---- "Send to Global Watch" from an editor -----------------------------------------------------
+
+    /** Right-click in an ObjectScript editor: open Global Watch on that editor's server, set its namespace and put the
+     *  global under the cursor into the global field. Adds nothing and reads nothing - the user edits and presses Enter. */
+    async sendFromEditor() {
+        const ed = vscode.window.activeTextEditor;
+        if (!ed) { void vscode.window.showInformationMessage('IRIS Global Watch: open an ObjectScript file and put the cursor on a global first.'); return; }
+        const sel = ed.selection;
+        const line = ed.document.lineAt(sel.start.line).text;
+        const to = sel.end.line === sel.start.line ? sel.end.character : line.length;
+        const found = findGlobalReference(line, sel.start.character, to);
+
+        if (found.kind === 'routine') { void vscode.window.showInformationMessage('IRIS Global Watch: that is a routine reference (label^routine, $$^routine, do ^routine), not a global - nothing sent.'); return; }
+        if (found.kind === 'private') { void vscode.window.showInformationMessage(`IRIS Global Watch: ^||${found.name} is a process-private global - it only exists inside the process that created it, so another connection cannot watch it.`); return; }
+        if (found.kind === 'none') {
+            void vscode.window.showInformationMessage(found.reason === 'comment'
+                ? 'IRIS Global Watch: the cursor is in a comment. Select the global (or move into code) and try again.'
+                : 'IRIS Global Watch: put the cursor inside a ^global reference, or select a global name, then try again.');
+            return;
+        }
+
+        const uri = ed.document.uri;
+        const config = vscode.workspace.getConfiguration();
+        const servers: Record<string, any> = config.get('intersystems.servers') || config.get('interSystems.servers') || {};
+        const conn = vscode.workspace.getConfiguration('objectscript', uri).get<ObjectScriptConn>('conn');
+        const where = resolveEditorServer({ scheme: uri.scheme, authority: uri.authority, query: uri.query }, conn, servers);
+
+        let serverId = where.serverId;
+        if (!serverId) {
+            const names = Object.keys(servers);
+            if (names.length === 0) { void vscode.window.showWarningMessage('IRIS Global Watch: no servers are configured (intersystems.servers).'); return; }
+            const items: vscode.QuickPickItem[] = names.map(n => {
+                const e = servers[n];
+                return { label: `$(server) ${e?.description && String(e.description).trim() !== '' ? e.description : n}`, description: e?.webServer?.host || e?.host || '', detail: n };
+            });
+            const why = where.problem ? ` (${where.problem})` : '';
+            const sel2 = await vscode.window.showQuickPick(items, { placeHolder: `Which IRIS server should Global Watch use?${why}`, ignoreFocusOut: true });
+            if (!sel2?.detail) return;
+            serverId = sel2.detail;
+        }
+
+        const c = await this.ensureConnection(serverId);
+        if (!c) return;
+        const namespace = found.namespace ?? where.namespace ?? '';
+
+        await vscode.commands.executeCommand(`${GLOBAL_WATCH_VIEW_ID}.focus`);
+        this.active = c.id;
+        this.persist();
+        this.pushState();
+        // start connecting first (it flips the tab to "connecting" at once), so the page keeps the cursor for the global field
+        const connecting = c.status === 'disconnected' ? this.connect(c) : undefined;
+        this.prefill(c.id, namespace, found.text);
+        const extra = found.notes.length ? ` (${found.notes.length} part${found.notes.length === 1 ? '' : 's'} left open as "any value")` : '';
+        vscode.window.setStatusBarMessage(`Global Watch: ${found.text} ready on ${c.label}${namespace ? ' / ' + namespace : ''}${extra} - edit it and press Enter to add`, 6000);
+        if (connecting) await connecting;
+    }
+
+    private prefill(cid: number, ns: string, text: string) {
+        if (this.view && this.webReady) this.post({ type: 'prefill', cid, ns, text });
+        else this.pendingPrefill = { cid, ns, text };      // the page is still loading; it asks for state when it is up
     }
 
     /** Password: settings.json, then Secret Storage, then ask once (same order the terminal uses). */
@@ -475,6 +586,7 @@ export function registerGlobalWatch(context: vscode.ExtensionContext, deps: Watc
         mgr,
         vscode.window.registerWebviewViewProvider(GLOBAL_WATCH_VIEW_ID, mgr, { webviewOptions: { retainContextWhenHidden: true } }),
         vscode.commands.registerCommand('iris-terminal.openGlobalWatch', () => mgr.open()),
+        vscode.commands.registerCommand('iris-terminal.sendToGlobalWatch', () => mgr.sendFromEditor()),
         vscode.commands.registerCommand('iris-terminal.globalWatchShowQuery', () => mgr.showLastQuery())
     ];
 }

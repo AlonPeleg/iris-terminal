@@ -1,6 +1,6 @@
 // Global Watch: pure logic (no vscode import) so it can be tested on its own.
 //
-//  - parsePattern / describePattern     the subscript pattern syntax (^g, ^g(), ^g(,), ^g("x"), ^g("x", ...)
+//  - parsePattern / describePattern     the subscript pattern syntax (see patternSyntax.ts: ^g, ^g(,), ^g("x",, 2:5, ["out", ...)
 //  - buildQueryLines / buildListLines   the ObjectScript that is typed into the hidden IRIS terminal
 //  - extractFrame / parseQueryOutput    reading the framed, hex-escaped answer back
 //
@@ -12,86 +12,23 @@
 // might insert into a long line are simply removed before parsing, which is safe because real line breaks
 // in values travel as \D; and \A; (hex 13 and 10).
 
-export type PatternSlot = null | { type: 'n' | 's'; value: string };   // null = any value
-
-export interface Pattern {
-    name: string;            // global name without the ^
-    slots: PatternSlot[];    // empty = the whole global
-    closed: boolean;         // true: exactly slots.length levels; false: that level and everything below
-}
-
-export type PatternResult = { ok: true; pattern: Pattern } | { ok: false; error: string };
-
-export function parsePattern(text: string): PatternResult {
-    const t = text.trim();
-    const m = /^\^(%?[A-Za-z][A-Za-z0-9.]*)([\s\S]*)$/.exec(t);
-    if (!m) return { ok: false, error: 'A pattern must start with ^ and a global name, e.g. ^mtemp' };
-    const name = m[1];
-    let rest = m[2];
-    if (rest === '') return { ok: true, pattern: { name, slots: [], closed: false } };
-    if (rest[0] !== '(') return { ok: false, error: 'Expected ( after the global name' };
-    rest = rest.slice(1);
-    let closed = false;
-
-    // Walk the text once: split on commas outside quotes, and notice a closing ) outside quotes.
-    const rawSlots: string[] = [];
-    let cur = '';
-    let inQ = false;
-    for (let i = 0; i < rest.length; i++) {
-        const c = rest[i];
-        if (c === '"') {
-            if (inQ && rest[i + 1] === '"') { cur += '""'; i++; continue; }   // doubled quote inside a string
-            inQ = !inQ; cur += c; continue;
-        }
-        if (!inQ && c === ')') {
-            if (rest.slice(i + 1).trim() !== '') return { ok: false, error: 'Nothing is allowed after the closing )' };
-            closed = true;
-            break;
-        }
-        if (!inQ && c === ',') { rawSlots.push(cur); cur = ''; continue; }
-        cur += c;
-    }
-    if (inQ) return { ok: false, error: 'Close the quote: text subscripts need both quotes (numbers do not)' };
-    rawSlots.push(cur);
-
-    const slots: PatternSlot[] = [];
-    for (const raw of rawSlots) {
-        const s = raw.trim();
-        if (s === '') { slots.push(null); continue; }
-        if (s[0] === '"') {
-            if (s.length < 2 || s[s.length - 1] !== '"') return { ok: false, error: 'Close the quote: text subscripts need both quotes (numbers do not)' };
-            const inner = s.slice(1, -1);
-            if (inner.replace(/""/g, '').includes('"')) return { ok: false, error: 'A quote inside text must be doubled ("")' };
-            const value = inner.replace(/""/g, '"');
-            if (/[\u0000-\u001f]/.test(value)) return { ok: false, error: 'Control characters are not allowed in a subscript' };
-            slots.push({ type: 's', value });
-            continue;
-        }
-        if (/^-?\d+(\.\d+)?$/.test(s)) { slots.push({ type: 'n', value: s }); continue; }
-        return { ok: false, error: 'Subscript ' + s + ' must be "text" or a number' };
-    }
-    return { ok: true, pattern: { name, slots, closed } };
-}
-
-const ORD = ['', '1st', '2nd', '3rd'];
-const ordinal = (i: number) => ORD[i] ?? `${i}th`;
-
-export function describePattern(p: Pattern): string {
-    if (p.slots.length === 0) return 'Everything in the global';
-    const L = p.slots.length;
-    const lit = p.slots.map((s, i) => s ? `${ordinal(i + 1)} = "${s.value}"` : '').filter(Boolean);
-    const cond = lit.length ? ' where ' + lit.join(' and ') : '';
-    if (p.closed) return `Level ${L} only${cond}`;
-    if (p.slots[L - 1] === null && L > 1) return `Everything below level ${L - 1}, not that node itself${cond}`;
-    return `That node and everything below it${cond}`;
-}
+import { Item, Pattern, PatternSlot, NS_RE } from './patternSyntax';
+export * from './patternSyntax';
 
 // ---- ObjectScript generation ---------------------------------------------------------------------
 
-export const NS_RE = /^[%A-Za-z0-9_-]+$/;
-
 function osString(s: string): string { return '"' + s.replace(/"/g, '""') + '"'; }
-function osLiteral(s: PatternSlot & object): string { return s.type === 'n' ? s.value : osString(s.value); }
+function osLiteral(s: { type: 'n' | 's'; value: string }): string { return s.type === 'n' ? numLit(s.value) : osString(s.value); }
+/** A number as ObjectScript code; negative numbers are parenthesised so no operator can swallow the minus. */
+function numLit(v: string): string { return v[0] === '-' ? '(' + v + ')' : v; }
+const CANON_NUM = /^(-?(0|[1-9]\d*)(\.\d*[1-9])?|-?\.\d*[1-9])$/;
+/** Subscript collation: numbers (by value) first, then text (by character code). */
+function collate(values: string[]): string[] {
+    const uniq = Array.from(new Set(values));
+    const nums = uniq.filter(v => CANON_NUM.test(v)).sort((a, b) => Number(a) - Number(b));
+    const strs = uniq.filter(v => !CANON_NUM.test(v)).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+    return nums.concat(strs);
+}
 
 // "@@WS" _ "7" _ "B"   (built by concatenation so an echo of this text never looks like a marker)
 const marker = (id: number, suffix: string) => `"@@WS"_"${id}"_"${suffix}"`;
@@ -109,12 +46,41 @@ export interface QueryOptions {
     valueLimit: number;     // most characters of a value to return
     namespace: string;      // namespace of the watch
     currentNamespace: string; // namespace the hidden session is in
+    scanLimit?: number;     // most subscripts looked at (filters can scan a lot); default 200000
+}
+
+export const DEFAULT_SCAN_LIMIT = 200000;
+
+// ---- the test applied to one subscript (variable v) by a filtered slot ----
+function itemTest(v: string, it: Item): string {
+    switch (it.type) {
+        case 'n': return `(${v}=${numLit(it.value)})`;
+        case 's': return `(${v}=${osString(it.value)})`;
+        case 'starts': return `($e(${v},1,$l(${osString(it.value)}))=${osString(it.value)})`;
+        case 'range': {
+            const parts = [`(${v}=(+${v}))`];        // a number, not text
+            if (it.lo !== null) parts.push(it.loInc ? `(${v}'<${numLit(it.lo)})` : `(${v}>${numLit(it.lo)})`);
+            if (it.hi !== null) parts.push(it.hiInc ? `(${v}'>${numLit(it.hi)})` : `(${v}<${numLit(it.hi)})`);
+            return '(' + parts.join('&&') + ')';
+        }
+    }
+}
+function slotTest(v: string, slot: Exclude<PatternSlot, null>): string {
+    switch (slot.type) {
+        case 'n': case 's': case 'starts': case 'range': return itemTest(v, slot);
+        case 'neq': return `(${v}'=${slot.num ? numLit(slot.value) : osString(slot.value)})`;
+        case 'contains': return `(${v}${slot.not ? "'" : ''}[${osString(slot.value)})`;
+        case 'follows': return `(${v}${slot.not ? "'" : ''}]${osString(slot.value)})`;
+        case 'match': return `(${v}${slot.not ? "'" : ''}?${slot.value})`;
+        case 'list': return '(' + slot.items.map(it => itemTest(v, it)).join('||') + ')';
+    }
 }
 
 /** The ObjectScript program (one string, not yet split into lines) for one watch. */
 export function buildQueryProgram(p: Pattern, o: QueryOptions): string {
     const g = '^' + p.name;
     const K = p.slots.length;
+    const scanLimit = Math.max(1, Math.floor(o.scanLimit ?? DEFAULT_SCAN_LIMIT));
     const ref = (i: number) => g + '(' + Array.from({ length: i }, (_, k) => 'zs' + (k + 1)).join(',') + ')';
 
     // Writes one record. `src` = variable holding the node name, `depth` = how many subscripts to print,
@@ -137,6 +103,8 @@ export function buildQueryProgram(p: Pattern, o: QueryOptions): string {
         `q:zwt  s zwn=zwr ${emit}s zwb=zwr } `;
     const descend = `s zwr=zwn,zwb=zwn,zwp=$e(zwn,1,$l(zwn)-1)_"," ${below(K)}`;
 
+    // Looking at a subscript counts towards the scan limit, so a filter that matches nothing cannot run for ever.
+    const guard = `s zwy=zwy+1 i zwy>${scanLimit} { s zwt=2 q } `;
     const levels = (i: number): string => {
         if (i > K) {
             const node = `s zwn=$na(${ref(K)}) ${emit}`;
@@ -144,8 +112,27 @@ export function buildQueryProgram(p: Pattern, o: QueryOptions): string {
         }
         const slot = p.slots[i - 1];
         const v = 'zs' + i;
-        if (slot) return `s ${v}=${osLiteral(slot)} i $d(${ref(i)}) { ${levels(i + 1)}} `;
-        return `s ${v}="" f { s ${v}=$o(${ref(i)}) q:${v}=""  q:zwt  ${levels(i + 1)}} `;
+        if (slot && (slot.type === 'n' || slot.type === 's')) return `s ${v}=${osLiteral(slot)} i $d(${ref(i)}) { ${levels(i + 1)}} `;
+        if (slot && slot.type === 'list' && slot.items.every(it => it.type === 'n' || it.type === 's')) {
+            // only exact values: visit just those, in collation order
+            const vals = collate(slot.items.map(it => (it as { value: string }).value)).map(x => (CANON_NUM.test(x) ? numLit(x) : osString(x)));
+            return `s zwL${i}=$lb(${vals.join(',')}) f zwI${i}=1:1:$ll(zwL${i}) { q:zwt  s ${v}=$lg(zwL${i},zwI${i}) i $d(${ref(i)}) { ${levels(i + 1)}} } `;
+        }
+        if (!slot) return `s ${v}="" f { s ${v}=$o(${ref(i)}) q:${v}=""  q:zwt  ${guard}${levels(i + 1)}} `;
+
+        // A filter: look at the subscripts of this level one by one. Numeric ranges and plain prefixes do not need
+        // to look at all of them: start just before the range and stop as soon as it is over.
+        let start = `s ${v}="" `;
+        let stop = '';
+        if (slot.type === 'range') {
+            if (slot.lo !== null) start = `s ${v}=${numLit(slot.lo)} s ${v}=$o(${ref(i)},-1) `;
+            stop = `q:'(${v}=(+${v}))  ` + (slot.hi !== null ? (slot.hiInc ? `q:(${v}>${numLit(slot.hi)})  ` : `q:(${v}'<${numLit(slot.hi)})  `) : '');
+        } else if (slot.type === 'starts' && !/^[-+.0-9]/.test(slot.value)) {
+            const t = osString(slot.value);
+            start = `s ${v}=${t} s ${v}=$o(${ref(i)},-1) `;
+            stop = `q:($e(${v},1,$l(${t}))'=${t})  `;
+        }
+        return `${start}f { s ${v}=$o(${ref(i)}) q:${v}=""  q:zwt  ${stop}${guard}i ${slotTest(v, slot)} { ${levels(i + 1)}} } `;
     };
 
     let body: string;
@@ -159,7 +146,7 @@ export function buildQueryProgram(p: Pattern, o: QueryOptions): string {
     const switched = o.namespace.toUpperCase() !== o.currentNamespace.toUpperCase();
     const zn = switched ? `zn ${osString(o.namespace)} ` : '';
     const back = switched ? `zn ${osString(o.currentNamespace)} ` : '';
-    return `s zwq=0,zwt=0 w ${marker(o.id, 'B')} try { ${zn}${body}w ${marker(o.id, 'E|')}_$s($d(${g}):1,1:0)_"|"_zwt } ` +
+    return `s zwq=0,zwt=0,zwy=0 w ${marker(o.id, 'B')} try { ${zn}${body}w ${marker(o.id, 'E|')}_$s($d(${g}):1,1:0)_"|"_zwt } ` +
         ERR_PART(o.id) + back + `w ${marker(o.id, 'Z')}`;
 }
 
@@ -211,6 +198,7 @@ export interface WatchRow { subs: WatchSub[]; value: string | null; valueCut?: b
 export interface QueryResult {
     exists: boolean;
     truncated: boolean;
+    scanLimit?: boolean;      // stopped after looking at the most subscripts allowed; the rows are partial
     rows: WatchRow[];
     error?: string;
 }
@@ -239,7 +227,9 @@ export function parseQueryOutput(payload: string, id: number, encoding: string):
         }
         return { subs, value: null };
     });
-    return { exists: exists === '1', truncated: trunc === '1', rows };
+    return trunc === '2'
+        ? { exists: exists === '1', truncated: false, scanLimit: true, rows }
+        : { exists: exists === '1', truncated: trunc === '1', rows };
 }
 
 export function parseNamespaces(payload: string, id: number, encoding: string): { names: string[]; error?: string } {
