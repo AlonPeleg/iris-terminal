@@ -3,6 +3,11 @@ import * as net from 'net';
 import * as tls from 'tls';
 import { registerGlobalWatch } from './watchPanel';
 import { GLOBAL_VIEWER_HTML } from './globalViewerHtml';
+import { buildInvocation } from './methodRun';
+import { chooseSession } from './terminalChoice';
+import { resolveEditorServer, ObjectScriptConn } from './editorServer';
+import { NS_RE } from './patternSyntax';
+import { RunLensProvider, RUN_LENS_SELECTOR, RUN_LENS_ENABLED_KEY } from './runLens';
 import { Analysis, analyzeSelection, applyAnswers, buildFillParts, classifyAnswer, fillValuesToAnswers, flattenForTerminal, ObjectChoice, objectExpression, parseClassContext, parseIncDefines, Slot } from './sendSelection';
 
 let viewerPanel: vscode.WebviewPanel | undefined;
@@ -62,6 +67,7 @@ export interface IrisSession {
     userSent: boolean;
     passSent: boolean;
     nsSent: boolean;
+    ready: boolean;         // at a prompt in the wanted namespace: code can be typed now
     isConnected: boolean;   // socket has produced data at least once
     isAlive: boolean;       // false once the socket has closed/errored and we're waiting for reconnect
 
@@ -137,85 +143,14 @@ export function activate(context: vscode.ExtensionContext) {
         const selection = await vscode.window.showQuickPick(serverItems, { placeHolder: 'Select an IRIS server' });
         if (!selection || !selection.detail) return;
 
-        const chosenId = selection.detail;
-        const entry = serverList[chosenId];
-        const serverLabel = selection.label.replace('$(star-full) ', '').replace('$(server) ', '');
-
         // detectedNamespace was read from whatever isfs file/editor happened to be active,
         // which is only meaningful if it actually belongs to the server just picked. If the
         // user picked a different server than the one detected, that namespace belongs to the
-        // OTHER server and must not be carried over — otherwise we'd try to `zn` into a
+        // OTHER server and must not be carried over - otherwise we'd try to `zn` into a
         // namespace name that may not even exist on this server.
-        if (chosenId !== activeServerName) {
-            detectedNamespace = '';
-        }
-
-        const host = entry?.webServer?.host || entry?.host || '';
-        const user = entry?.username || '';
-        let pass = entry?.password || '';
-        let passSource: IrisSession['passSource'] = pass ? 'settings' : 'none';
-
-        // --- Secure password handling ---
-        // Prefer a password already in settings.json for backward compatibility, but never
-        // require plaintext storage: if none is configured, check SecretStorage, and if that's
-        // empty too, prompt once and offer to remember it securely.
-        if (!pass && user) {
-            const secretKey = getSecretKey(chosenId, user);
-            pass = (await context.secrets.get(secretKey)) || '';
-            if (pass) {
-                passSource = 'secret';
-            } else {
-                const entered = await vscode.window.showInputBox({
-                    prompt: `Password for ${user}@${chosenId} (leave blank to skip auto-login)`,
-                    password: true,
-                    ignoreFocusOut: true
-                });
-                if (entered) {
-                    pass = entered;
-                    passSource = 'manual';
-                    const remember = await vscode.window.showQuickPick(['Yes', 'No'], {
-                        placeHolder: 'Remember this password securely (VS Code Secret Storage)?'
-                    });
-                    if (remember === 'Yes') {
-                        await context.secrets.store(secretKey, entered);
-                        passSource = 'secret';
-                    }
-                }
-            }
-        } else if (pass) {
-            vscode.window.showWarningMessage(
-                `IRIS Terminal: the password for "${chosenId}" is stored in plain text in settings.json. ` +
-                `Remove it from settings.json and reconnect to store it securely instead.`,
-                'Got it'
-            );
-        }
-
-        const encodingSelection = await vscode.window.showQuickPick([
-            { label: "Hebrew (Windows-1255)", description: "Cache servers", detail: "windows1255" },
-            { label: "UTF-8", description: "IRIS servers", detail: "utf8" }
-        ], { placeHolder: `Select Encoding for ${chosenId}` });
-
-        if (!encodingSelection) return;
-        const chosenEncoding = encodingSelection.detail;
-
-        const finalHost = await vscode.window.showInputBox({
-            prompt: `Connect to ${chosenId} (${encodingSelection.label})`,
-            value: host,
-            ignoreFocusOut: true
-        });
-
-        if (!finalHost) return;
-
-        openTerminal(context, {
-            host: finalHost,
-            user,
-            pass,
-            passSource,
-            serverId: chosenId,
-            serverDisplayName: serverLabel,
-            initialNamespace: detectedNamespace,
-            encoding: chosenEncoding || 'utf8'
-        });
+        const chosenId = selection.detail;
+        const serverLabel = selection.label.replace('$(star-full) ', '').replace('$(server) ', '');
+        return await startTerminal(context, chosenId, serverLabel, chosenId === activeServerName ? detectedNamespace : '', true);
     });
 
     // --- GLOBAL VIEWER LINK PROVIDER (only inside IRIS terminals) ---
@@ -345,12 +280,82 @@ export function activate(context: vscode.ExtensionContext) {
 // ---------------------------------------------------------------------------------------------
 
 function registerSendSelectionCommands(context: vscode.ExtensionContext): vscode.Disposable[] {
+    const runLens = new RunLensProvider();
     return [
-        vscode.commands.registerCommand('iris-terminal.sendSelection', () => sendSelectionToIris(context, false)),
-        vscode.commands.registerCommand('iris-terminal.runSelection', () => sendSelectionToIris(context, true)),
+        // One command now: send the code AND press Enter (the Fill-in view is the review step). The old
+        // "send without running" id stays registered so a keybinding that used it keeps working.
+        vscode.commands.registerCommand('iris-terminal.sendSelection', () => sendSelectionToIris(context)),
+        vscode.commands.registerCommand('iris-terminal.runSelection', () => sendSelectionToIris(context)),
+        vscode.commands.registerCommand('iris-terminal.runMethod', (uri: vscode.Uri, line: number) => runMethodInTerminal(uri, line)),
+        vscode.languages.registerCodeLensProvider(RUN_LENS_SELECTOR, runLens),
+        vscode.workspace.onDidChangeConfiguration(e => { if (e.affectsConfiguration(RUN_LENS_ENABLED_KEY)) runLens.refresh(); }),
+        runLens,
         vscode.window.registerWebviewViewProvider(FILL_IN_VIEW_ID, new FillInViewProvider(),
             { webviewOptions: { retainContextWhenHidden: true } })
     ];
+}
+
+// The server / namespace an editor belongs to (its isfs address, or the workspace's objectscript.conn).
+function editorTarget(uri?: vscode.Uri): { serverId?: string; namespace?: string } {
+    if (!uri) return {};
+    const config = vscode.workspace.getConfiguration();
+    const servers: Record<string, any> = config.get('intersystems.servers') || config.get('interSystems.servers') || {};
+    const conn = vscode.workspace.getConfiguration('objectscript', uri).get<ObjectScriptConn>('conn');
+    const r = resolveEditorServer({ scheme: uri.scheme, authority: uri.authority, query: uri.query }, conn, servers);
+    return { serverId: r.serverId, namespace: r.namespace };
+}
+
+// Waits until a freshly opened terminal is logged in and at a prompt in its namespace.
+async function waitUntilReady(session: IrisSession, timeoutMs = 45000): Promise<boolean> {
+    const until = Date.now() + timeoutMs;
+    while (Date.now() < until) {
+        if (session.ready && session.isAlive) return true;
+        if (session.terminal && !sessions.has(session.terminal)) return false;      // the terminal was closed meanwhile
+        await new Promise(r => setTimeout(r, 150));
+    }
+    vscode.window.showWarningMessage(`IRIS Terminal: "${session.terminal?.name ?? 'the terminal'}" is not ready yet (still connecting or waiting for a login). Try again when it shows a prompt.`);
+    return false;
+}
+
+// The terminal that code from this editor should go to (see terminalChoice.ts): one already on the editor's
+// namespace, else one of the same server (switched with `zn`), else a new terminal opened on that server; if the
+// editor's server is not known, any terminal as before (asked when there are several; opened when there is none).
+async function acquireSession(uri?: vscode.Uri): Promise<{ session: IrisSession; switchTo?: string } | undefined> {
+    const target = editorTarget(uri);
+    const all = [...sessions.values()].filter(s => s.terminal);
+    const active = vscode.window.activeTerminal;
+    const choice = chooseSession(
+        all.map(s => ({ serverId: s.serverId, ns: s.lastKnownNS, alive: s.isAlive && !!s.client, active: s.terminal === active })),
+        target);
+
+    if (choice.kind === 'use') {
+        const session = all[choice.index];
+        if (!session.ready && !(await waitUntilReady(session))) return undefined;
+        return { session, switchTo: choice.switchTo };
+    }
+    if (choice.kind === 'reconnect') {
+        vscode.window.showWarningMessage(`IRIS Terminal: the terminal for ${target.serverId} is disconnected. Reconnect it first (press Enter in the terminal, or right-click its tab).`);
+        return undefined;
+    }
+    if (choice.kind === 'open' && target.serverId) {
+        const config = vscode.workspace.getConfiguration();
+        const servers: any = config.get('intersystems.servers') || config.get('interSystems.servers') || {};
+        const entry = servers[target.serverId];
+        const label = entry?.description && String(entry.description).trim() !== '' ? String(entry.description) : target.serverId;
+        if (!extContext) return undefined;
+        vscode.window.setStatusBarMessage(`IRIS Terminal: no terminal for ${label} is open - opening one${target.namespace ? ' in ' + target.namespace : ''}...`, 10000);
+        const session = await startTerminal(extContext, target.serverId, label, target.namespace ?? '', false);
+        if (!session) return undefined;
+        return (await waitUntilReady(session)) ? { session } : undefined;
+    }
+    // editor's server unknown
+    if (all.length === 0) {
+        const session = await vscode.commands.executeCommand<IrisSession | undefined>('iris-terminal.open', uri);
+        if (!session) return undefined;
+        return (await waitUntilReady(session)) ? { session } : undefined;
+    }
+    const picked = await pickIrisSession();
+    return picked ? { session: picked } : undefined;
 }
 
 // The IRIS terminal to send to: the only one, or - when several are open - the one picked from a list
@@ -429,7 +434,7 @@ async function findMacroDefinitions(): Promise<Record<string, string>> {
 
 // --- Send Selection ---------------------------------------------------------------------------
 
-async function sendSelectionToIris(context: vscode.ExtensionContext, run: boolean) {
+async function sendSelectionToIris(context: vscode.ExtensionContext) {
     const editor = vscode.window.activeTextEditor;
     if (!editor) {
         vscode.window.showInformationMessage('IRIS Terminal: open a file and select some code first.');
@@ -444,15 +449,36 @@ async function sendSelectionToIris(context: vscode.ExtensionContext, run: boolea
     }
     text = text.replace(/\r\n/g, '\n');
 
-    const session = await pickIrisSession();
-    if (!session) return;
-    const terminalName = session.terminal?.name ?? 'IRIS';
-
-    const cfg = vscode.workspace.getConfiguration('iris-terminal.sendSelection');
     // The class the code comes from: lets `..Method(` become `##class(Pkg.Class).Method(` and tells instance methods apart.
     // (only looked up when the code uses `..` or $this: nothing to translate otherwise)
     const usesCurrentClass = /\.\.[A-Za-z%]|\$this/i.test(text);
-    const analysis = analyzeSelection(text, usesCurrentClass ? parseClassContext(editor.document.getText()) : undefined);
+    await sendCodeToIris(text, usesCurrentClass ? editor.document.getText() : undefined, editor.document.uri);
+}
+
+// "Run in Terminal" lens on a label / function / method signature: build the call and send it like a selection.
+async function runMethodInTerminal(uri: vscode.Uri, line: number) {
+    let doc: vscode.TextDocument;
+    try { doc = await vscode.workspace.openTextDocument(uri); } catch { return; }
+    const isClass = doc.languageId === 'objectscript-class' || /\.cls$/i.test(uri.path);
+    const built = buildInvocation(doc.getText(), line, isClass, uri.path);
+    if (!built.ok) { vscode.window.showInformationMessage(`IRIS Terminal: ${built.error}`); return; }
+    await sendCodeToIris(built.code, isClass ? doc.getText() : undefined, uri);
+}
+
+// Pipeline for any code: pick the terminal, find what needs filling in, then send (and run) it.
+async function sendCodeToIris(text: string, classSource: string | undefined, docUri?: vscode.Uri) {
+    const run = true;
+    const acquired = await acquireSession(docUri);
+    if (!acquired) return;
+    const session = acquired.session;
+    const terminalName = session.terminal?.name ?? 'IRIS';
+    // The terminal is on another namespace than the editor: `zn` it first, in the same line (if the namespace does not exist
+    // the error stops the line, so the code never runs in the wrong place).
+    const prefix = acquired.switchTo && NS_RE.test(acquired.switchTo) ? `zn "${acquired.switchTo}" ` : '';
+    if (prefix) vscode.window.setStatusBarMessage(`IRIS Terminal: switching "${terminalName}" to namespace ${acquired.switchTo} for this run`, 6000);
+
+    const cfg = vscode.workspace.getConfiguration('iris-terminal.sendSelection');
+    const analysis = analyzeSelection(text, classSource !== undefined ? parseClassContext(classSource) : undefined);
     const wantsMacroLookup = cfg.get<boolean>('lookupMacros', true) &&
         analysis.slots.some(s => s.kind === 'macro' && !s.text.includes('('));
     const macroDefs = wantsMacroLookup ? await findMacroDefinitions() : {};
@@ -462,7 +488,7 @@ async function sendSelectionToIris(context: vscode.ExtensionContext, run: boolea
 
     // Nothing to ask (no variables, no object needed): send right away.
     if (analysis.slots.length === 0 && analysis.objectRefs.length === 0) {
-        await deliverToIris(session, terminalName, flattenForTerminal(applyAnswers(text, analysis, {})), run);
+        await deliverToIris(session, terminalName, prefix + flattenForTerminal(applyAnswers(text, analysis, {})), run);
         return;
     }
 
@@ -473,7 +499,7 @@ async function sendSelectionToIris(context: vscode.ExtensionContext, run: boolea
         const v = prefillFor(slot);
         if (v.trim() !== '') initial[slot.key] = v;
     }
-    await openFillIn(session, terminalName, text, analysis, run, initial);
+    await openFillIn(session, terminalName, text, analysis, run, initial, prefix);
 }
 
 // Writes the line to the terminal. Returns false if it was not sent (nothing to send, or the session
@@ -513,6 +539,7 @@ interface FillInState {
     src: string;
     analysis: Analysis;
     run: boolean;
+    prefix: string;          // typed before the code, e.g. `zn "ACC" ` when the terminal has to change namespace first
 }
 
 let fillInView: vscode.WebviewView | undefined;
@@ -546,8 +573,8 @@ function postFillInLoad(initial: Record<string, string>) {
 let fillInInitial: Record<string, string> = {};
 
 async function openFillIn(session: IrisSession, terminalName: string, src: string, analysis: Analysis, run: boolean,
-    initial: Record<string, string>) {
-    fillInState = { session, terminalName, src, analysis, run };
+    initial: Record<string, string>, prefix: string) {
+    fillInState = { session, terminalName, src, analysis, run, prefix };
     fillInInitial = initial;
     await vscode.commands.executeCommand('setContext', FILL_IN_CONTEXT_KEY, true);
     if (fillInView && fillInReady) postFillInLoad(initial);       // else: sent when the view reports it is ready
@@ -627,7 +654,7 @@ class FillInViewProvider implements vscode.WebviewViewProvider {
                     }
 
                     const finalText = flattenForTerminal(applyAnswers(st.src, st.analysis, answers, object));
-                    await deliverToIris(st.session, st.terminalName, finalText, st.run, closeFillIn);
+                    await deliverToIris(st.session, st.terminalName, st.prefix + finalText, st.run, closeFillIn);
                 } finally {
                     fillInBusy = false;
                 }
@@ -1063,10 +1090,99 @@ export const encodeInput = (data: string, encoding: string): Buffer => {
     return Buffer.from(bytes);
 };
 
+const ENCODING_MEMORY_KEY = 'iris-terminal.encoding:';
+
+/** Opens a terminal on a configured server: password (settings, Secret Storage or asked once), encoding and host.
+ *  `interactive` (the "open terminal" command) always asks for the encoding and confirms the host; an automatic open
+ *  (from "Run in Terminal" when no terminal is open) reuses the last encoding picked for that server and the configured host. */
+async function startTerminal(context: vscode.ExtensionContext, chosenId: string, serverLabel: string,
+    detectedNamespace: string, interactive: boolean): Promise<IrisSession | undefined> {
+    const config = vscode.workspace.getConfiguration();
+    const serverList: any = config.get('intersystems.servers') || config.get('interSystems.servers') || {};
+    const entry = serverList[chosenId];
+    const host = entry?.webServer?.host || entry?.host || '';
+    const user = entry?.username || '';
+    let pass = entry?.password || '';
+    let passSource: IrisSession['passSource'] = pass ? 'settings' : 'none';
+
+    // --- Secure password handling ---
+    // Prefer a password already in settings.json for backward compatibility, but never
+    // require plaintext storage: if none is configured, check SecretStorage, and if that's
+    // empty too, prompt once and offer to remember it securely.
+    if (!pass && user) {
+        const secretKey = getSecretKey(chosenId, user);
+        pass = (await context.secrets.get(secretKey)) || '';
+        if (pass) {
+            passSource = 'secret';
+        } else {
+            const entered = await vscode.window.showInputBox({
+                prompt: `Password for ${user}@${chosenId} (leave blank to skip auto-login)`,
+                password: true,
+                ignoreFocusOut: true
+            });
+            if (entered) {
+                pass = entered;
+                passSource = 'manual';
+                const remember = await vscode.window.showQuickPick(['Yes', 'No'], {
+                    placeHolder: 'Remember this password securely (VS Code Secret Storage)?'
+                });
+                if (remember === 'Yes') {
+                    await context.secrets.store(secretKey, entered);
+                    passSource = 'secret';
+                }
+            }
+        }
+    } else if (pass) {
+        vscode.window.showWarningMessage(
+            `IRIS Terminal: the password for "${chosenId}" is stored in plain text in settings.json. ` +
+            `Remove it from settings.json and reconnect to store it securely instead.`,
+            'Got it'
+        );
+    }
+
+    const remembered = context.globalState.get<string>(ENCODING_MEMORY_KEY + chosenId)
+        || context.globalState.get<string>('iris-terminal.globalWatchEncoding:' + chosenId);
+    let chosenEncoding: string | undefined;
+    let encodingLabel = remembered === 'windows1255' ? 'Hebrew (Windows-1255)' : 'UTF-8';
+    if (!interactive && (remembered === 'utf8' || remembered === 'windows1255')) {
+        chosenEncoding = remembered;
+    } else {
+        const encodingSelection = await vscode.window.showQuickPick([
+            { label: "Hebrew (Windows-1255)", description: "Cache servers", detail: "windows1255" },
+            { label: "UTF-8", description: "IRIS servers", detail: "utf8" }
+        ], { placeHolder: `Select Encoding for ${chosenId}` });
+        if (!encodingSelection) return undefined;
+        chosenEncoding = encodingSelection.detail;
+        encodingLabel = encodingSelection.label;
+    }
+    await context.globalState.update(ENCODING_MEMORY_KEY + chosenId, chosenEncoding);
+
+    let finalHost: string | undefined = host;
+    if (interactive || !host) {
+        finalHost = await vscode.window.showInputBox({
+            prompt: `Connect to ${chosenId} (${encodingLabel})`,
+            value: host,
+            ignoreFocusOut: true
+        });
+    }
+    if (!finalHost) return undefined;
+
+    return openTerminal(context, {
+        host: finalHost,
+        user,
+        pass,
+        passSource,
+        serverId: chosenId,
+        serverDisplayName: serverLabel,
+        initialNamespace: detectedNamespace,
+        encoding: chosenEncoding || 'utf8'
+    });
+}
+
 function openTerminal(context: vscode.ExtensionContext, opts: {
     host: string; user: string; pass: string; passSource: IrisSession['passSource']; serverId: string;
     serverDisplayName: string; initialNamespace: string; encoding: string;
-}) {
+}): IrisSession {
     const writeEmitter = new vscode.EventEmitter<string>();
     const nameEmitter = new vscode.EventEmitter<string>();
     const closeEmitter = new vscode.EventEmitter<number | void>();
@@ -1088,6 +1204,7 @@ function openTerminal(context: vscode.ExtensionContext, opts: {
         userSent: false,
         passSent: false,
         nsSent: false,
+        ready: false,
         isConnected: false,
         isAlive: false,
         context,
@@ -1132,6 +1249,7 @@ function openTerminal(context: vscode.ExtensionContext, opts: {
     session.terminal = terminal;
     sessions.set(terminal, session);
     terminal.show();
+    return session;
 }
 
 function connectSession(session: IrisSession) {
@@ -1139,6 +1257,7 @@ function connectSession(session: IrisSession) {
     session.userSent = false;
     session.passSent = false;
     session.nsSent = false;
+    session.ready = false;
     session.isConnected = false;
     session.reauthPromptShown = false;
     // Freeze the namespace to `zn` into for this connect attempt now, before any data arrives.
@@ -1240,6 +1359,8 @@ function connectSession(session: IrisSession) {
             // can react to (pre-authenticated sessions, certificate-based auth, a differently
             // worded login flow), which left passSent permanently false and this zn command
             // never sent at all, even though login had clearly already succeeded.
+            // Ready once a prompt shows and, when a namespace has to be entered first, once the prompt after that `zn` shows.
+            if (promptMatch && (session.nsSent || !session.targetNamespace)) session.ready = true;
             if (promptMatch && session.targetNamespace && !session.nsSent) {
                 session.nsSent = true;
                 client.write('zn "' + session.targetNamespace + '"\r\n');

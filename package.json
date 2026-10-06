@@ -3,7 +3,7 @@
   "displayName": "IRIS Terminal Bridge",
   "description": "Auto-SSL Terminal Bridge for InterSystems",
   "publisher": "alonpe",
-  "version": "0.1.42",
+  "version": "0.1.44",
   "icon": "image/icon.png",
   "engines": {
     "vscode": "^1.95.0"
@@ -11,7 +11,11 @@
   "categories": [
     "Other"
   ],
-  "activationEvents": [],
+  "activationEvents": [
+    "onLanguage:objectscript",
+    "onLanguage:objectscript-class",
+    "onLanguage:objectscript-int"
+  ],
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
@@ -46,12 +50,12 @@
         "title": "IRIS: Global Watch - Show Last Query"
       },
       {
-        "command": "iris-terminal.sendSelection",
-        "title": "IRIS: Send Selection to Terminal"
+        "command": "iris-terminal.runSelection",
+        "title": "IRIS: Send to Terminal"
       },
       {
-        "command": "iris-terminal.runSelection",
-        "title": "IRIS: Send Selection to Terminal and Run"
+        "command": "iris-terminal.runMethod",
+        "title": "IRIS: Run in Terminal"
       }
     ],
     "keybindings": [
@@ -61,6 +65,9 @@
       }
     ],
     "menus": {
+      "commandPalette": [
+        { "command": "iris-terminal.runMethod", "when": "false" }
+      ],
       "view/title": [
         {
           "command": "iris-terminal.open",
@@ -88,19 +95,14 @@
       ],
       "editor/context": [
         {
-          "command": "iris-terminal.sendSelection",
+          "command": "iris-terminal.runSelection",
           "when": "editorHasSelection",
           "group": "iris-terminal@1"
         },
         {
-          "command": "iris-terminal.runSelection",
-          "when": "editorHasSelection",
-          "group": "iris-terminal@2"
-        },
-        {
           "command": "iris-terminal.sendToGlobalWatch",
           "when": "editorLangId =~ /objectscript/ || resourceScheme =~ /^isfs/",
-          "group": "iris-terminal@3"
+          "group": "iris-terminal@2"
         }
       ]
     },
@@ -131,6 +133,11 @@
           "type": "boolean",
           "default": true,
           "description": "Look up simple '#define Name value' macros in the workspace's .inc files to prefill the prompt for unknown macros."
+        },
+        "iris-terminal.runLens.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show a \"Run in Terminal\" link above every label, function and method signature in ObjectScript files (next to \"Debug | Copy Invocation\")."
         }
       }
     },

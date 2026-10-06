@@ -4,6 +4,17 @@ All notable changes to the "iris-terminal" extension will be documented in this 
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.1.44]
+
+- New: **Run in Terminal / Send to Terminal now follow the editor's server and namespace.** A terminal of the editor's server that is already on the editor's namespace is used; otherwise a terminal of that server is switched there with `zn "NS"` in the same line; if there is no terminal for that server one is opened (on the editor's namespace, encoding remembered per server) and the code is sent once it is ready. Previously you got "no IRIS terminal is open" or the code ran in whatever namespace the terminal happened to be on.
+- Fix: in `.int` / `.mac` labels, `&name` (by reference) and `*name` (output) in the signature are passed as `.name` (`do Label^RTN(.out)`) instead of `name`.
+
+## [0.1.43]
+
+- New: **Run in Terminal** link next to *Debug | Copy Invocation* above every label (`.mac` / `.int`) and `Method` / `ClassMethod` (`.cls`). It builds the call - `set status=$$Label^ROUTINE(args)` for a function, `do Label^ROUTINE(args)` for a subroutine, `set status=##class(Pkg.Class).Method(args)` / `do ##class(...)...` for class methods (instance methods ask for a variable, `%New()` or `%OpenId(id)`) - and sends it through the normal Fill-in step. A label is a function when its body has a `quit` / `return` with a value. Setting `iris-terminal.runLens.enabled` turns the link off.
+- Change: the extension now loads when an ObjectScript file is opened (`onLanguage:objectscript`, `-class`, `-int`) so the link is there without using a command first.
+- Change: **one "Send to Terminal"** instead of Send and Send-and-Run. It always presses Enter; the Fill-in step is the review. `iris-terminal.sendSelection` stays registered as an alias so keybindings keep working.
+
 ## [0.1.42]
 
 - Fix: **Send to Global Watch** with only the global's name selected (a double-click) sent the whole reference with its subscripts. Now what you select is what you get: `mtempTest` -> `^mtempTest`, `mtempTest(` -> `^mtempTest(`, `^g("a","b",` -> `^g("a","b",`. With nothing selected (just the cursor in the reference) it still sends the whole reference.

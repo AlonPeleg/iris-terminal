@@ -48,20 +48,17 @@ A bottom-panel tab (**IRIS: Open Global Watch**) that watches globals on a serve
 * Values can be split on `*`, `^`, `|`, `~` or your own delimiter; long JSON values collapse; a watch shows at most 500 nodes at a time (**Show more** loads the next 500).
 * Each connection is an IRIS process (it can use a license seat like a terminal does). **IRIS: Global Watch - Show Last Query** prints the ObjectScript that was typed, if you need to see what runs on the server.
 
-### ⌨️ Send Selection to Terminal
-Select code in any editor, right-click, and choose one of:
+### ⌨️ Send to Terminal
+Select code in any editor, right-click, and choose **IRIS: Send to Terminal**. It types the code at the IRIS prompt and presses Enter. The *Fill in variables* step below is where you review it, so there is no separate "send but don't run" action any more. (The old command id `iris-terminal.sendSelection` still works for existing keybindings and does the same.)
 
-* **IRIS: Send Selection to Terminal** – types the code at the IRIS prompt and stops, so you can review it and press Enter yourself.
-* **IRIS: Send Selection to Terminal and Run** – same, then presses Enter.
-
-With no selection, the current line is sent. Multi-line code is flattened to a single line (comments removed), so nothing runs before you decide it should.
+With no selection, the current line is sent. Multi-line code is flattened to a single line (comments removed). Code that needs nothing filled in runs straight away.
 
 **Which terminal.** With one IRIS terminal open it is used; with several, you are asked which one first.
 
 **Fill in the variables.** Copied code usually depends on variables that only exist inside the original method. After the terminal is chosen (it is only asked when more than one is open), a small *Fill in variables* tab opens in the bottom panel next to Terminal, so it never splits or covers your editor. It shows the code with every name that the code *reads* but does not assign as an inline field:
 
 * **Tab / Enter** – next variable, **Shift+Tab** – back.
-* **Enter on the last one** – sends the line (*Send*) or sends it and presses Enter (*Send and Run*). The action is the one you picked from the menu. **Esc** – cancel.
+* **Enter on the last one** – sends the line and runs it. **Esc** – cancel.
 * Leave a field empty to keep the original text. A variable used several times is typed once and mirrored where it repeats.
 * A line under the code tells what you typed (number, string, object, by-reference...) and warns about unbalanced quotes or brackets.
 
@@ -118,3 +115,19 @@ The extension leverages your existing InterSystems server definitions. Ensure yo
         "description": "Production Server"
     }
 }
+### ▶ Run in Terminal (link above labels, functions and methods)
+A **Run in Terminal** link appears next to *Debug | Copy Invocation* above every label in `.mac` / `.int` files and every `Method` / `ClassMethod` in `.cls` files. Click it and the call is built, run through the same *Fill in variables* step, and sent to the IRIS terminal:
+
+| Signature | What is sent |
+|---|---|
+| routine function `TestFunction(test)` (its body has a `quit value` / `return value`) | `set status=$$TestFunction^WBLRSHOWFF(test)` |
+| routine label `TestLabel(test)` (only a bare `quit`, or none) | `do TestLabel^WBLRSHOWFF(test)` |
+| `ClassMethod getAllTables(ByRef out) As %Status` in `Tafnit.App.Portfolio.utils` | `set status=##class(Tafnit.App.Portfolio.utils).getAllTables(.out)` |
+| `ClassMethod Reset()` (no return type) | `do ##class(Tafnit.App.Portfolio.utils).Reset()` |
+| instance `Method Save(id) As %Status` | you choose the object (a variable you have, `%New()` or `%OpenId(id)`), e.g. `set status=##class(...).%OpenId(12).Save(5)` |
+
+* The routine name comes from the `ROUTINE` line (or the file name); the class name from the `Class` line. `ByRef` / `Output` / `InOut` parameters of a method, and `&name` / `*name` in the signature of a routine label, are passed as `.name`.
+* A label counts as a function when its body (down to the next label) has a `quit` or `return` that carries a value. When unsure it uses `do`, which is harmless for a function and avoids an error for a subroutine.
+* The result lands in a variable called `status`; look at it in the terminal (`zw status`).
+* **Which terminal, which namespace.** The editor's server and namespace come from its address (`isfs://server:NS/...`) or the workspace's `objectscript.conn`. A terminal of that server that is already on that namespace is used (the active one first). If the only terminals of that server are on another namespace, one of them is switched with `zn "NS"` typed in the same line before the code (a namespace that does not exist stops the line, so nothing runs in the wrong place), and it stays on that namespace. If there is no terminal for that server, one is opened on the editor's namespace (it asks for the encoding the first time and remembers it) and the code is sent once it is at a prompt. If a server's only terminal is disconnected, you are told to reconnect it. When the editor's server cannot be told (a plain local file without `objectscript.conn`), it uses the open terminal as before (asked when there are several) or starts the normal *open terminal* flow when there is none. The same applies to **Send to Terminal**.
+* The link needs the extension to be loaded when an ObjectScript file opens (a small one-time load per VS Code window). Switch the link off with the setting `iris-terminal.runLens.enabled`.
