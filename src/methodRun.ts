@@ -155,6 +155,34 @@ function classArgs(inside: string): string[] {
     return args;
 }
 
+/** The code of the label / method whose signature is on `line`: for a class, what is between the body's `{` and the
+ *  closing `}` at the start of a line; for a routine, the rest of the label line and the lines down to the next label.
+ *  Used to see what running it would do (kills on globals); '' when it cannot be read. */
+export function bodyOf(text: string, line: number, isClass: boolean): string {
+    const lines = splitLines(text);
+    const here = lines[line];
+    if (here === undefined) return '';
+    const body: string[] = [];
+    if (isClass) {
+        if (!METHOD_RE.test(here)) return '';
+        let i = line;
+        for (; i < Math.min(lines.length, line + MAX_SIGNATURE_LINES); i++) {
+            const b = lines[i].indexOf('{');
+            if (b >= 0 && (/\{\s*$/.test(lines[i]) || (i > line && /^\s*\{/.test(lines[i])))) { body.push(lines[i].slice(b + 1)); break; }
+        }
+        for (i++; i < lines.length && !/^\}/.test(lines[i]); i++) body.push(lines[i]);
+        return body.join('\n');
+    }
+    const label = labelAt(here);
+    if (label === undefined) return '';
+    body.push(' '.repeat(label.length) + here.slice(label.length));
+    for (let i = line + 1; i < lines.length; i++) {
+        if (labelAt(lines[i]) !== undefined || /^\}/.test(lines[i])) break;
+        body.push(lines[i]);
+    }
+    return body.join('\n');
+}
+
 /** The ObjectScript that calls the label / method whose signature is on `line` (0-based). */
 export function buildInvocation(text: string, line: number, isClass: boolean, fileName: string): Built {
     const lines = splitLines(text);

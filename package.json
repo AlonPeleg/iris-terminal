@@ -3,7 +3,7 @@
   "displayName": "IRIS Terminal Bridge",
   "description": "Auto-SSL Terminal Bridge for InterSystems",
   "publisher": "alonpe",
-  "version": "0.1.44",
+  "version": "0.2.2",
   "icon": "image/icon.png",
   "engines": {
     "vscode": "^1.95.0"
@@ -56,23 +56,169 @@
       {
         "command": "iris-terminal.runMethod",
         "title": "IRIS: Run in Terminal"
+      },
+      {
+        "command": "iris-terminal.runSnippet",
+        "title": "IRIS: Run Snippet..."
+      },
+      {
+        "command": "iris-terminal.snippet.run",
+        "title": "Run",
+        "icon": "$(play)"
+      },
+      {
+        "command": "iris-terminal.snippet.edit",
+        "title": "Edit code",
+        "icon": "$(code)"
+      },
+      {
+        "command": "iris-terminal.snippet.rename",
+        "title": "Rename...",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "iris-terminal.snippet.delete",
+        "title": "Delete",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "iris-terminal.snippet.saveSelection",
+        "title": "IRIS: Save Selection as Snippet",
+        "icon": "$(add)"
+      },
+      {
+        "command": "iris-terminal.snippet.click",
+        "title": "Select snippet"
+      },
+      {
+        "command": "iris-terminal.snippet.tabSize.1",
+        "title": "1 space"
+      },
+      {
+        "command": "iris-terminal.snippet.tabSize.1.on",
+        "title": "✓ 1 space"
+      },
+      {
+        "command": "iris-terminal.snippet.tabSize.2",
+        "title": "2 spaces"
+      },
+      {
+        "command": "iris-terminal.snippet.tabSize.2.on",
+        "title": "✓ 2 spaces"
+      },
+      {
+        "command": "iris-terminal.snippet.tabSize.3",
+        "title": "3 spaces"
+      },
+      {
+        "command": "iris-terminal.snippet.tabSize.3.on",
+        "title": "✓ 3 spaces"
+      },
+      {
+        "command": "iris-terminal.snippet.tabSize.4",
+        "title": "4 spaces"
+      },
+      {
+        "command": "iris-terminal.snippet.tabSize.4.on",
+        "title": "✓ 4 spaces"
       }
     ],
     "keybindings": [
       {
         "command": "iris-terminal.open",
         "key": "ctrl+alt+t"
+      },
+      {
+        "command": "iris-terminal.snippet.run",
+        "key": "enter",
+        "when": "focusedView == iris-terminal.snippets && !inputFocus"
+      },
+      {
+        "command": "iris-terminal.snippet.rename",
+        "key": "f2",
+        "when": "focusedView == iris-terminal.snippets && !inputFocus"
+      },
+      {
+        "command": "iris-terminal.snippet.delete",
+        "key": "delete",
+        "mac": "cmd+backspace",
+        "when": "focusedView == iris-terminal.snippets && !inputFocus"
       }
     ],
     "menus": {
       "commandPalette": [
-        { "command": "iris-terminal.runMethod", "when": "false" }
+        {
+          "command": "iris-terminal.runMethod",
+          "when": "false"
+        },
+        {
+          "command": "iris-terminal.snippet.run",
+          "when": "false"
+        },
+        {
+          "command": "iris-terminal.snippet.rename",
+          "when": "false"
+        },
+        {
+          "command": "iris-terminal.snippet.delete",
+          "when": "false"
+        },
+        {
+          "command": "iris-terminal.snippet.edit",
+          "when": "false"
+        },
+        {
+          "command": "iris-terminal.snippet.click",
+          "when": "false"
+        },
+        {
+          "command": "iris-terminal.snippet.tabSize.1",
+          "when": "false"
+        },
+        {
+          "command": "iris-terminal.snippet.tabSize.1.on",
+          "when": "false"
+        },
+        {
+          "command": "iris-terminal.snippet.tabSize.2",
+          "when": "false"
+        },
+        {
+          "command": "iris-terminal.snippet.tabSize.2.on",
+          "when": "false"
+        },
+        {
+          "command": "iris-terminal.snippet.tabSize.3",
+          "when": "false"
+        },
+        {
+          "command": "iris-terminal.snippet.tabSize.3.on",
+          "when": "false"
+        },
+        {
+          "command": "iris-terminal.snippet.tabSize.4",
+          "when": "false"
+        },
+        {
+          "command": "iris-terminal.snippet.tabSize.4.on",
+          "when": "false"
+        }
       ],
       "view/title": [
         {
           "command": "iris-terminal.open",
           "when": "view == workbench.explorer.fileView",
           "group": "navigation"
+        },
+        {
+          "command": "iris-terminal.snippet.saveSelection",
+          "when": "view == iris-terminal.snippets",
+          "group": "navigation@1"
+        },
+        {
+          "submenu": "iris-terminal.snippetTabWidth",
+          "when": "view == iris-terminal.snippets",
+          "group": "navigation@0"
         }
       ],
       "explorer/context": [
@@ -103,6 +249,95 @@
           "command": "iris-terminal.sendToGlobalWatch",
           "when": "editorLangId =~ /objectscript/ || resourceScheme =~ /^isfs/",
           "group": "iris-terminal@2"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "iris-terminal.snippet.run",
+          "when": "view == iris-terminal.snippets && viewItem == irisSnippet",
+          "group": "inline@1"
+        },
+        {
+          "command": "iris-terminal.snippet.edit",
+          "when": "view == iris-terminal.snippets && viewItem == irisSnippet",
+          "group": "inline@2"
+        },
+        {
+          "command": "iris-terminal.snippet.rename",
+          "when": "view == iris-terminal.snippets && viewItem == irisSnippet",
+          "group": "inline@3"
+        },
+        {
+          "command": "iris-terminal.snippet.delete",
+          "when": "view == iris-terminal.snippets && viewItem == irisSnippet",
+          "group": "inline@4"
+        },
+        {
+          "command": "iris-terminal.snippet.run",
+          "when": "view == iris-terminal.snippets && viewItem == irisSnippet",
+          "group": "1_run@1"
+        },
+        {
+          "command": "iris-terminal.snippet.edit",
+          "when": "view == iris-terminal.snippets && viewItem == irisSnippet",
+          "group": "2_edit@1"
+        },
+        {
+          "command": "iris-terminal.snippet.rename",
+          "when": "view == iris-terminal.snippets && viewItem == irisSnippet",
+          "group": "2_edit@2"
+        },
+        {
+          "command": "iris-terminal.snippet.delete",
+          "when": "view == iris-terminal.snippets && viewItem == irisSnippet",
+          "group": "3_delete@1"
+        },
+        {
+          "submenu": "iris-terminal.snippetTabWidth",
+          "when": "view == iris-terminal.snippets",
+          "group": "9_view@1"
+        }
+      ],
+      "iris-terminal.snippetTabWidth": [
+        {
+          "command": "iris-terminal.snippet.tabSize.1.on",
+          "when": "config.iris-terminal.snippets.tabSize == 1",
+          "group": "1@1"
+        },
+        {
+          "command": "iris-terminal.snippet.tabSize.1",
+          "when": "config.iris-terminal.snippets.tabSize != 1",
+          "group": "1@1"
+        },
+        {
+          "command": "iris-terminal.snippet.tabSize.2.on",
+          "when": "config.iris-terminal.snippets.tabSize == 2",
+          "group": "1@2"
+        },
+        {
+          "command": "iris-terminal.snippet.tabSize.2",
+          "when": "config.iris-terminal.snippets.tabSize != 2",
+          "group": "1@2"
+        },
+        {
+          "command": "iris-terminal.snippet.tabSize.3.on",
+          "when": "config.iris-terminal.snippets.tabSize == 3",
+          "group": "1@3"
+        },
+        {
+          "command": "iris-terminal.snippet.tabSize.3",
+          "when": "config.iris-terminal.snippets.tabSize != 3",
+          "group": "1@3"
+        },
+        {
+          "command": "iris-terminal.snippet.tabSize.4.on",
+          "when": "config.iris-terminal.snippets.tabSize == 4",
+          "group": "1@4"
+        },
+        {
+          "command": "iris-terminal.snippet.tabSize.4",
+          "when": "config.iris-terminal.snippets.tabSize != 4",
+          "group": "1@4"
         }
       ]
     },
@@ -138,6 +373,17 @@
           "type": "boolean",
           "default": true,
           "description": "Show a \"Run in Terminal\" link above every label, function and method signature in ObjectScript files (next to \"Debug | Copy Invocation\")."
+        },
+        "iris-terminal.snippets.tabSize": {
+          "type": "integer",
+          "default": 1,
+          "enum": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "description": "How wide one indentation level (a tab, or 4 leading spaces) is shown in the Snippets tab: the hover and the code lines. Display only: the saved code is not changed. Also set from the Tab Width menu (right-click, or the title bar of the Snippets tab)."
         }
       }
     },
@@ -152,6 +398,11 @@
           "id": "iris-terminal-watch",
           "title": "Global Watch",
           "icon": "$(eye)"
+        },
+        {
+          "id": "iris-terminal-snippets",
+          "title": "Snippets",
+          "icon": "$(symbol-snippet)"
         }
       ]
     },
@@ -170,8 +421,27 @@
           "id": "iris-terminal.globalWatch",
           "name": "Global Watch"
         }
+      ],
+      "iris-terminal-snippets": [
+        {
+          "id": "iris-terminal.snippets",
+          "name": "Snippets"
+        }
       ]
-    }
+    },
+    "viewsWelcome": [
+      {
+        "view": "iris-terminal.snippets",
+        "contents": "No snippets yet.\nUse **Save as snippet** in the Fill-in tab, or select code in an editor and save it here.\n[Save Selection as Snippet](command:iris-terminal.snippet.saveSelection)"
+      }
+    ],
+    "submenus": [
+      {
+        "id": "iris-terminal.snippetTabWidth",
+        "label": "Tab Width",
+        "icon": "$(whitespace)"
+      }
+    ]
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",

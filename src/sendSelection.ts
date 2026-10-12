@@ -883,6 +883,53 @@ export function analyzeSelection(src: string, cls?: ClassContext): Analysis {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Kills on globals (shown in the Fill-in view so a destructive line is never sent without a look)
+// ---------------------------------------------------------------------------------------------
+
+/** One `kill` / `zkill` argument that removes global data, as written in the code. */
+export interface GlobalKill {
+    start: number;
+    end: number;
+    /** the reference as written: `^g`, `^g(i,"x")`, `@ref` */
+    text: string;
+    /** no subscripts: the whole global goes */
+    whole: boolean;
+    /** `kill @x`: what it kills is only known at run time */
+    indirect: boolean;
+}
+
+/** Every `kill ^g...` / `zkill ^g...` (and `kill @x`) in the code, in order. Process-private `^||x` globals and the
+ *  local-only forms (`kill`, `kill x`, `kill (a,b)`) are not listed. Only what is written here is seen: a kill inside a
+ *  method the code calls is not. */
+export function findGlobalKills(src: string): GlobalKill[] {
+    const out: GlobalKill[] = [];
+    for (const s of splitStatements(tokenize(src))) {
+        if (s.cmd !== 'kill' && s.cmd !== 'zkill') continue;
+        for (const seg of splitTop(s.args, ',')) {
+            const i = seg.findIndex(isSig);
+            if (i < 0) continue;
+            const t = seg[i];
+            if (t.type === 'skip' && t.text.startsWith('^') && !t.text.startsWith('^$') && !t.text.startsWith('^||')) {
+                let end = t.end;
+                const next = seg[i + 1];
+                const subscripted = isP(next, '(') && next.start === t.end;
+                if (subscripted) {
+                    const close = findMatching(seg, i + 1);
+                    end = close >= 0 ? seg[close].end : seg[seg.length - 1].end;
+                }
+                out.push({ start: t.start, end, text: src.slice(t.start, end), whole: !subscripted, indirect: false });
+            } else if (isP(t, '@')) {
+                let last = i;
+                for (let k = i + 1; k < seg.length; k++) if (isSig(seg[k])) last = k;
+                const end = seg[last].end;
+                out.push({ start: t.start, end, text: src.slice(t.start, end), whole: false, indirect: true });
+            }
+        }
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------------------------
 // Answers: classification, substitution
 // ---------------------------------------------------------------------------------------------
 
@@ -1071,26 +1118,49 @@ export function applyAnswers(src: string, analysis: Analysis, answers: Record<st
 // ---------------------------------------------------------------------------------------------
 
 /** One piece of the code shown in the fill-in view: fixed text, or one occurrence of a variable. */
+/** `kill` = index into the kills passed to buildFillParts when this piece is part of that kill's reference. */
 export type FillPart =
-    | { lit: string }
-    | { key: string; text: string; first: boolean };
+    | { lit: string; kill?: number }
+    | { key: string; text: string; first: boolean; kill?: number };
 
-/** The code cut into fixed text and variable occurrences, in order (the first occurrence of each is the one typed into). */
-export function buildFillParts(src: string, analysis: Analysis): FillPart[] {
+/** The code cut into fixed text and variable occurrences, in order (the first occurrence of each is the one typed into).
+ *  Fixed text is also cut at the edges of each kill reference, so the view can mark exactly that text. */
+export function buildFillParts(src: string, analysis: Analysis, kills: { start: number; end: number }[] = []): FillPart[] {
     const occs: { start: number; end: number; slot: Slot }[] = [];
     for (const slot of analysis.slots) for (const o of slot.occurrences) occs.push({ start: o.start, end: o.end, slot });
     occs.sort((a, b) => a.start - b.start);
 
+    const killAt = (pos: number): number | undefined => {
+        const k = kills.findIndex(r => pos >= r.start && pos < r.end);
+        return k < 0 ? undefined : k;
+    };
+    const cuts = new Set<number>();
+    for (const r of kills) { cuts.add(r.start); cuts.add(r.end); }
     const parts: FillPart[] = [];
+    const pushLit = (from: number, to: number) => {
+        let a = from;
+        const inner = [...cuts].filter(c => c > from && c < to).sort((x, y) => x - y);
+        for (const c of [...inner, to]) {
+            if (c > a) {
+                const kill = killAt(a);
+                parts.push(kill === undefined ? { lit: src.slice(a, c) } : { lit: src.slice(a, c), kill });
+            }
+            a = c;
+        }
+    };
+
     const seen = new Set<string>();
     let pos = 0;
     for (const o of occs) {
-        if (o.start > pos) parts.push({ lit: src.slice(pos, o.start) });
-        parts.push({ key: o.slot.key, text: o.slot.text, first: !seen.has(o.slot.key) });
+        if (o.start > pos) pushLit(pos, o.start);
+        const kill = killAt(o.start);
+        const part: FillPart = { key: o.slot.key, text: o.slot.text, first: !seen.has(o.slot.key) };
+        if (kill !== undefined) part.kill = kill;
+        parts.push(part);
         seen.add(o.slot.key);
         pos = o.end;
     }
-    if (pos < src.length) parts.push({ lit: src.slice(pos) });
+    if (pos < src.length) pushLit(pos, src.length);
     return parts;
 }
 

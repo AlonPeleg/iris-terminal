@@ -3,12 +3,14 @@ import * as net from 'net';
 import * as tls from 'tls';
 import { registerGlobalWatch } from './watchPanel';
 import { GLOBAL_VIEWER_HTML } from './globalViewerHtml';
-import { buildInvocation } from './methodRun';
+import { bodyOf, buildInvocation, findSignatures } from './methodRun';
+import { focusSnippet, getSnippet, KillNote, loadClass, pickAndRunSnippet, promptSaveSnippet, registerSnippetsView, Snippet, updateSnippetCode } from './snippets';
+import { WatchClient } from './watchClient';
 import { chooseSession } from './terminalChoice';
 import { resolveEditorServer, ObjectScriptConn } from './editorServer';
 import { NS_RE } from './patternSyntax';
 import { RunLensProvider, RUN_LENS_SELECTOR, RUN_LENS_ENABLED_KEY } from './runLens';
-import { Analysis, analyzeSelection, applyAnswers, buildFillParts, classifyAnswer, fillValuesToAnswers, flattenForTerminal, ObjectChoice, objectExpression, parseClassContext, parseIncDefines, Slot } from './sendSelection';
+import { Analysis, analyzeSelection, applyAnswers, buildFillParts, ClassContext, classifyAnswer, fillValuesToAnswers, findGlobalKills, flattenForTerminal, GlobalKill, ObjectChoice, objectExpression, parseClassContext, parseIncDefines, Slot } from './sendSelection';
 
 let viewerPanel: vscode.WebviewPanel | undefined;
 // True once the currently-open Global Viewer webview's script has announced itself as 'ready'
@@ -287,6 +289,8 @@ function registerSendSelectionCommands(context: vscode.ExtensionContext): vscode
         vscode.commands.registerCommand('iris-terminal.sendSelection', () => sendSelectionToIris(context)),
         vscode.commands.registerCommand('iris-terminal.runSelection', () => sendSelectionToIris(context)),
         vscode.commands.registerCommand('iris-terminal.runMethod', (uri: vscode.Uri, line: number) => runMethodInTerminal(uri, line)),
+        vscode.commands.registerCommand('iris-terminal.runSnippet', () => pickAndRunSnippet(context, runSnippet)),
+        ...registerSnippetsView(context, { run: runSnippet, edit: editSnippetInFillIn }),
         vscode.languages.registerCodeLensProvider(RUN_LENS_SELECTOR, runLens),
         vscode.workspace.onDidChangeConfiguration(e => { if (e.affectsConfiguration(RUN_LENS_ENABLED_KEY)) runLens.refresh(); }),
         runLens,
@@ -452,54 +456,167 @@ async function sendSelectionToIris(context: vscode.ExtensionContext) {
     // The class the code comes from: lets `..Method(` become `##class(Pkg.Class).Method(` and tells instance methods apart.
     // (only looked up when the code uses `..` or $this: nothing to translate otherwise)
     const usesCurrentClass = /\.\.[A-Za-z%]|\$this/i.test(text);
-    await sendCodeToIris(text, usesCurrentClass ? editor.document.getText() : undefined, editor.document.uri);
+    await sendCodeToIris(text, usesCurrentClass ? parseClassContext(editor.document.getText()) : undefined, { docUri: editor.document.uri });
 }
 
 // "Run in Terminal" lens on a label / function / method signature: build the call and send it like a selection.
+// The body of what it calls is read too, so a kill on a global inside it is shown in the Fill-in view.
 async function runMethodInTerminal(uri: vscode.Uri, line: number) {
     let doc: vscode.TextDocument;
     try { doc = await vscode.workspace.openTextDocument(uri); } catch { return; }
+    const text = doc.getText();
     const isClass = doc.languageId === 'objectscript-class' || /\.cls$/i.test(uri.path);
-    const built = buildInvocation(doc.getText(), line, isClass, uri.path);
+    const built = buildInvocation(text, line, isClass, uri.path);
     if (!built.ok) { vscode.window.showInformationMessage(`IRIS Terminal: ${built.error}`); return; }
-    await sendCodeToIris(built.code, isClass ? doc.getText() : undefined, uri);
+    const where = findSignatures(text, isClass).find(sg => sg.line === line)?.name;
+    const bodyKills: KillNote[] = findGlobalKills(bodyOf(text, line, isClass))
+        .map(k => ({ text: k.text, whole: k.whole, indirect: k.indirect, where }));
+    await sendCodeToIris(built.code, isClass ? parseClassContext(text) : undefined, { docUri: uri, bodyKills });
+}
+
+// Running a snippet (Snippets tab or "IRIS: Run Snippet..."): the terminal is picked the usual way (no editor, so: the
+// only one, asked when there are several, opened when there is none), then which namespace to run in (`zn` there first
+// when it is not the terminal's), then the Fill-in view asks for the snippet's variables.
+async function runSnippet(snip: Snippet) {
+    await sendCodeToIris(snip.code, loadClass(snip.cls), { bodyKills: snip.bodyKills, askNamespace: snip.name });
+}
+
+// Namespace lists per server, read once per VS Code session over a short hidden connection (like Global Watch does).
+const namespaceCache = new Map<string, Promise<string[]>>();
+
+function serverNamespaces(session: IrisSession): Promise<string[]> {
+    const key = `${session.serverId}|${session.user}`.toLowerCase();
+    let p = namespaceCache.get(key);
+    if (!p) {
+        p = (async () => {
+            const client = new WatchClient({
+                host: session.host, port: getTelnetPort(), user: session.user, pass: session.pass,
+                encoding: session.encoding, sslMode: getSslMode(), rejectUnauthorized: getRejectUnauthorized(),
+                connectTimeoutMs: 20000, requestTimeoutMs: 20000
+            });
+            try {
+                await client.connect();
+                return await client.listNamespaces();
+            } finally {
+                client.close('done');
+            }
+        })();
+        namespaceCache.set(key, p);
+        p.catch(() => { if (namespaceCache.get(key) === p) namespaceCache.delete(key); });   // try again next time
+    }
+    return p;
+}
+
+/** Which namespace to run in: the terminal's current one first (Enter = run there), the server's others as they load.
+ *  A namespace name can also be typed. Returns undefined when cancelled. */
+function pickNamespace(session: IrisSession, title: string): Promise<string | undefined> {
+    return new Promise(resolve => {
+        const current = (session.lastKnownNS || '').toUpperCase();
+        type NsItem = vscode.QuickPickItem & { ns: string };
+        const qp = vscode.window.createQuickPick<NsItem>();
+        qp.title = `Run "${title}" on ${session.terminal?.name ?? session.serverDisplayName} - in which namespace?`;
+        qp.placeholder = 'Enter runs it in the current namespace; another one is switched to with zn first';
+        const setItems = (names: string[], note?: string) => {
+            const others = names.map(n => n.toUpperCase()).filter(n => n !== current).sort();
+            const items: NsItem[] = [];
+            if (current) items.push({ label: current, description: 'current', ns: current });
+            for (const n of others) items.push({ label: n, ns: n });
+            if (note) items.push({ label: '', kind: vscode.QuickPickItemKind.Separator, ns: '' }, { label: note, ns: '', alwaysShow: true });
+            const active = qp.activeItems[0]?.ns;
+            qp.items = items;
+            const keep = active ? items.find(i => i.ns === active) : undefined;
+            if (keep) qp.activeItems = [keep];
+        };
+        setItems([]);
+        qp.busy = true;
+        let done = false;
+        serverNamespaces(session).then(
+            names => { if (!done) { qp.busy = false; setItems(names); } },
+            err => { if (!done) { qp.busy = false; setItems([], `Could not read the namespace list: ${err?.message ?? err}. Type a namespace name to use another one.`); } });
+        qp.onDidAccept(() => {
+            const picked = qp.selectedItems[0]?.ns || qp.activeItems[0]?.ns;
+            const typed = qp.value.trim().toUpperCase();
+            const ns = picked || (NS_RE.test(typed) ? typed : '');
+            if (!ns) return;
+            done = true;
+            resolve(ns);
+            qp.hide();
+        });
+        qp.onDidHide(() => { if (!done) { done = true; resolve(undefined); } qp.dispose(); });
+        qp.show();
+    });
+}
+
+// "Edit code" on a snippet: its code in the Fill-in tab's edit mode, with Save / Save and run instead of Run.
+async function editSnippetInFillIn(snip: Snippet) {
+    const fresh = extContext ? getSnippet(extContext, snip.id) ?? snip : snip;
+    const busy = fillInState;
+    if (busy && !(busy.snippetEdit && busy.snippetEdit.id === fresh.id)) {
+        const what = busy.snippetEdit ? `editing the snippet "${busy.snippetEdit.name}"` : `a run on ${busy.terminalName}`;
+        const ok = await vscode.window.showWarningMessage(`The Fill-in tab is in use for ${what}. Replace it?`, { modal: true }, 'Replace');
+        if (ok !== 'Replace') return;
+    }
+    const cls = loadClass(fresh.cls);
+    const analysis = analyzeSelection(fresh.code, cls);
+    await openFillIn({
+        session: undefined, terminalName: '', src: fresh.code, analysis, run: false, prefix: '', cls,
+        kills: findGlobalKills(fresh.code), bodyKills: fresh.bodyKills ?? [], snippetEdit: { id: fresh.id, name: fresh.name }
+    }, {});
+}
+
+interface SendOptions {
+    docUri?: vscode.Uri;
+    /** kills on globals inside the method that the code calls (not visible in the code itself) */
+    bodyKills?: KillNote[];
+    /** ask which namespace to run in once the terminal is known (the value is the title: the snippet's name) */
+    askNamespace?: string;
 }
 
 // Pipeline for any code: pick the terminal, find what needs filling in, then send (and run) it.
-async function sendCodeToIris(text: string, classSource: string | undefined, docUri?: vscode.Uri) {
+async function sendCodeToIris(text: string, cls: ClassContext | undefined, opts: SendOptions = {}) {
     const run = true;
-    const acquired = await acquireSession(docUri);
+    const acquired = await acquireSession(opts.docUri);
     if (!acquired) return;
     const session = acquired.session;
     const terminalName = session.terminal?.name ?? 'IRIS';
+    let switchTo = acquired.switchTo;
+    if (opts.askNamespace !== undefined) {
+        const ns = await pickNamespace(session, opts.askNamespace);
+        if (ns === undefined) return;                                         // cancelled
+        switchTo = ns.toUpperCase() !== session.lastKnownNS.toUpperCase() ? ns.toUpperCase() : undefined;
+    }
     // The terminal is on another namespace than the editor: `zn` it first, in the same line (if the namespace does not exist
     // the error stops the line, so the code never runs in the wrong place).
-    const prefix = acquired.switchTo && NS_RE.test(acquired.switchTo) ? `zn "${acquired.switchTo}" ` : '';
-    if (prefix) vscode.window.setStatusBarMessage(`IRIS Terminal: switching "${terminalName}" to namespace ${acquired.switchTo} for this run`, 6000);
+    const prefix = switchTo && NS_RE.test(switchTo) ? `zn "${switchTo}" ` : '';
+    if (prefix) vscode.window.setStatusBarMessage(`IRIS Terminal: switching "${terminalName}" to namespace ${switchTo} for this run`, 6000);
 
-    const cfg = vscode.workspace.getConfiguration('iris-terminal.sendSelection');
-    const analysis = analyzeSelection(text, classSource !== undefined ? parseClassContext(classSource) : undefined);
-    const wantsMacroLookup = cfg.get<boolean>('lookupMacros', true) &&
-        analysis.slots.some(s => s.kind === 'macro' && !s.text.includes('('));
-    const macroDefs = wantsMacroLookup ? await findMacroDefinitions() : {};
+    const analysis = analyzeSelection(text, cls);
+    const kills = findGlobalKills(text);
+    const bodyKills = opts.bodyKills ?? [];
 
-    const prefillFor = (slot: Slot): string =>
-        slot.kind === 'macro' && !slot.text.includes('(') ? (macroDefs[slot.text.slice(3).toLowerCase()] ?? '') : '';
-
-    // Nothing to ask (no variables, no object needed): send right away.
-    if (analysis.slots.length === 0 && analysis.objectRefs.length === 0) {
+    // Nothing to ask (no variables, no object needed) and nothing destructive to point out: send right away.
+    if (analysis.slots.length === 0 && analysis.objectRefs.length === 0 && kills.length === 0 && bodyKills.length === 0) {
         await deliverToIris(session, terminalName, prefix + flattenForTerminal(applyAnswers(text, analysis, {})), run);
         return;
     }
 
     // Otherwise open the fill-in view. Every field starts empty (= keep the original); only a macro found
     // in a workspace .inc file starts with its value.
+    const initial = await macroPrefill(analysis);
+    await openFillIn({ session, terminalName, src: text, analysis, run, prefix, cls, kills, bodyKills }, initial);
+}
+
+// Starting values for unknown macros: simple `#define Name value` lines found in the workspace's .inc files.
+async function macroPrefill(analysis: Analysis): Promise<Record<string, string>> {
     const initial: Record<string, string> = {};
-    for (const slot of analysis.slots) {
-        const v = prefillFor(slot);
+    const wanted = analysis.slots.filter(s => s.kind === 'macro' && !s.text.includes('('));
+    if (wanted.length === 0 || !vscode.workspace.getConfiguration('iris-terminal.sendSelection').get<boolean>('lookupMacros', true)) return initial;
+    const defs = await findMacroDefinitions();
+    for (const slot of wanted) {
+        const v = defs[slot.text.slice(3).toLowerCase()] ?? '';
         if (v.trim() !== '') initial[slot.key] = v;
     }
-    await openFillIn(session, terminalName, text, analysis, run, initial, prefix);
+    return initial;
 }
 
 // Writes the line to the terminal. Returns false if it was not sent (nothing to send, or the session
@@ -534,12 +651,16 @@ const FILL_IN_VIEW_ID = 'iris-terminal.fillIn';
 const FILL_IN_CONTEXT_KEY = 'iris-terminal.fillInActive';
 
 interface FillInState {
-    session: IrisSession;
+    session?: IrisSession;   // none while a saved snippet's code is being edited (nothing runs from that screen)
     terminalName: string;
     src: string;
     analysis: Analysis;
     run: boolean;
     prefix: string;          // typed before the code, e.g. `zn "ACC" ` when the terminal has to change namespace first
+    cls?: ClassContext;      // the class the code came from (re-used when the code is edited in the view)
+    kills: GlobalKill[];     // kills on globals written in the code (marked in the view)
+    bodyKills: KillNote[];   // kills inside the method the code calls (listed only)
+    snippetEdit?: { id: string; name: string };   // editing a saved snippet's code (Snippets tab > Edit code)
 }
 
 let fillInView: vscode.WebviewView | undefined;
@@ -547,7 +668,11 @@ let fillInReady = false;
 let fillInState: FillInState | undefined;
 let fillInBusy = false;
 
-function postFillInLoad(initial: Record<string, string>) {
+function killNotes(kills: GlobalKill[]): KillNote[] {
+    return kills.map(k => ({ text: k.text, whole: k.whole, indirect: k.indirect }));
+}
+
+function postFillInLoad(initial: Record<string, string>, note?: string) {
     const st = fillInState;
     if (!st || !fillInView) return;
     const info: Record<string, string> = {};
@@ -559,9 +684,15 @@ function postFillInLoad(initial: Record<string, string>) {
         type: 'load',
         terminal: st.terminalName,
         runLabel: st.run ? 'Run' : 'Send',
-        parts: buildFillParts(st.src, st.analysis),
+        parts: buildFillParts(st.src, st.analysis, st.kills),
         info,
         initial,
+        kills: killNotes(st.kills),
+        bodyKills: st.bodyKills,
+        note: note ?? '',
+        editOnly: !!st.snippetEdit,
+        snippetName: st.snippetEdit?.name ?? '',
+        editText: st.snippetEdit ? st.src : '',
         object: st.analysis.objectRefs.length === 0 ? null : {
             className: st.analysis.className ?? '',
             count: st.analysis.objectRefs.length,
@@ -572,9 +703,8 @@ function postFillInLoad(initial: Record<string, string>) {
 
 let fillInInitial: Record<string, string> = {};
 
-async function openFillIn(session: IrisSession, terminalName: string, src: string, analysis: Analysis, run: boolean,
-    initial: Record<string, string>, prefix: string) {
-    fillInState = { session, terminalName, src, analysis, run, prefix };
+async function openFillIn(state: FillInState, initial: Record<string, string>) {
+    fillInState = state;
     fillInInitial = initial;
     await vscode.commands.executeCommand('setContext', FILL_IN_CONTEXT_KEY, true);
     if (fillInView && fillInReady) postFillInLoad(initial);       // else: sent when the view reports it is ready
@@ -586,6 +716,26 @@ async function closeFillIn() {
     fillInInitial = {};
     fillInView?.webview.postMessage({ type: 'clear' });
     await vscode.commands.executeCommand('setContext', FILL_IN_CONTEXT_KEY, false);
+}
+
+// The object choice sent by the view (only meaningful when the code uses `..Method(` / `..Property` / `$this`).
+function objectFromMsg(st: FillInState, msg: any): ObjectChoice | undefined {
+    if (st.analysis.objectRefs.length === 0) return undefined;
+    const mode = msg?.object?.mode === 'new' || msg?.object?.mode === 'openid' ? msg.object.mode : 'var';
+    return { mode, value: String(msg?.object?.value ?? '') };
+}
+
+// Text typed in edit mode: normalised line ends, nothing else touched.
+function editedText(msg: any): string {
+    return String(msg?.text ?? '').replace(/\r\n?/g, '\n');
+}
+
+// The code changed in edit mode: analyse it again and show it with fields for what it needs now.
+async function reloadFillIn(st: FillInState, src: string, note?: string) {
+    const analysis = analyzeSelection(src, st.cls);
+    fillInState = { ...st, src, analysis, kills: findGlobalKills(src) };
+    fillInInitial = await macroPrefill(analysis);
+    postFillInLoad(fillInInitial, note);
 }
 
 class FillInViewProvider implements vscode.WebviewViewProvider {
@@ -607,7 +757,9 @@ class FillInViewProvider implements vscode.WebviewViewProvider {
 
             if (msg?.type === 'cancel') {
                 await closeFillIn();
-                await vscode.commands.executeCommand('workbench.action.focusActiveEditorGroup');
+                // editing a snippet: back to the Snippets tab; a run: back to the editor
+                if (st.snippetEdit && extContext) await focusSnippet(extContext, st.snippetEdit.id);
+                else await vscode.commands.executeCommand('workbench.action.focusActiveEditorGroup');
                 return;
             }
 
@@ -622,22 +774,90 @@ class FillInViewProvider implements vscode.WebviewViewProvider {
                 return;
             }
 
-            if (msg?.type === 'submit' && !fillInBusy) {
+            // ---- edit mode ----
+            // ✎ pressed: the code with what has been filled in so far, as plain text to edit (line breaks kept).
+            if (msg?.type === 'editStart') {
+                const answers = fillValuesToAnswers(st.analysis, msg.values ?? {});
+                const text = applyAnswers(st.src, st.analysis, answers, objectFromMsg(st, msg));
+                view.webview.postMessage({ type: 'editText', text, kills: killNotes(findGlobalKills(text)) });
+                return;
+            }
+            // typing in edit mode: keep the "Running will kill ..." line up to date
+            if (msg?.type === 'editKills') {
+                view.webview.postMessage({ type: 'editKillsResult', kills: killNotes(findGlobalKills(editedText(msg))) });
+                return;
+            }
+            // ✎ pressed again with changes: back to the fields, for the edited code
+            if (msg?.type === 'edited') {
+                await reloadFillIn(st, editedText(msg));
+                return;
+            }
+            // Run (or Ctrl+Enter) while editing: send it, unless the edit brought in something new to fill in
+            if (msg?.type === 'runEdited' && !fillInBusy && st.session) {
+                const session = st.session;
+                fillInBusy = true;
+                try {
+                    const src = editedText(msg);
+                    if (src.trim() === '') { vscode.window.showInformationMessage('IRIS Terminal: nothing to send.'); return; }
+                    const analysis = analyzeSelection(src, st.cls);
+                    const before = new Set(st.analysis.slots.map(s => s.key));
+                    const added = analysis.slots.filter(s => !before.has(s.key));
+                    if (added.length > 0 || analysis.objectRefs.length > 0) {
+                        const what = added.length > 0 ? added.map(s => s.text).join(', ') : 'the object';
+                        await reloadFillIn(st, src, `Fill in ${what}, then run.`);
+                        return;
+                    }
+                    const finalText = flattenForTerminal(applyAnswers(src, analysis, {}));
+                    await deliverToIris(session, st.terminalName, st.prefix + finalText, st.run, closeFillIn);
+                } finally {
+                    fillInBusy = false;
+                }
+                return;
+            }
+
+            // ---- save as snippet: the code with its variables as written (no values) ----
+            if (msg?.type === 'saveSnippet') {
+                if (!extContext) return;
+                const code = msg.editing ? editedText(msg) : st.src;
+                if (code.trim() === '') return;
+                const name = await promptSaveSnippet(extContext, {
+                    code, cls: st.cls, bodyKills: st.bodyKills
+                });
+                if (name) {
+                    view.webview.postMessage({ type: 'saved', name });
+                    vscode.window.setStatusBarMessage(`IRIS Terminal: saved snippet "${name}" - run it with "IRIS: Run Snippet"`, 6000);
+                }
+                return;
+            }
+
+            // ---- editing a saved snippet: Save / Save and run ----
+            if (msg?.type === 'snippetSave' && st.snippetEdit && extContext) {
+                const code = editedText(msg);
+                if (code.trim() === '') { vscode.window.showInformationMessage('IRIS Terminal: a snippet cannot be empty.'); return; }
+                const updated = await updateSnippetCode(extContext, st.snippetEdit.id, code);
+                await closeFillIn();
+                if (!updated) { vscode.window.showWarningMessage('IRIS Terminal: that snippet no longer exists.'); return; }
+                vscode.window.setStatusBarMessage(`IRIS Terminal: saved snippet "${updated.name}"`, 5000);
+                if (msg.run) await runSnippet(updated);                    // ends in the terminal / Fill-in tab
+                else await focusSnippet(extContext, updated.id);           // Save: back to the Snippets tab, on that snippet
+                return;
+            }
+
+            if (msg?.type === 'submit' && !fillInBusy && st.session) {
+                const session = st.session;
                 fillInBusy = true;
                 try {
                     const answers = fillValuesToAnswers(st.analysis, msg.values ?? {});
 
                     // which object the `..Method(` / `..Property` / `$this` uses should run on
-                    let object: ObjectChoice | undefined;
+                    const object = objectFromMsg(st, msg);
                     const problems: string[] = [];
-                    if (st.analysis.objectRefs.length > 0) {
-                        const mode = msg.object?.mode === 'new' || msg.object?.mode === 'openid' ? msg.object.mode : 'var';
-                        object = { mode, value: String(msg.object?.value ?? '') };
+                    if (object) {
                         const expr = objectExpression(st.analysis, object);
                         const uses = [...new Set(st.analysis.objectRefs.map(r => r.text))].slice(0, 3).join(', ');
                         if (expr === '') {
                             problems.push(`${uses}: no object given - it will fail at the terminal`);
-                        } else if (mode !== 'new') {
+                        } else if (object.mode !== 'new') {
                             const info = classifyAnswer(object.value);
                             if (info.kind === 'invalid') problems.push(`object: ${info.label}`);
                         }
@@ -654,7 +874,7 @@ class FillInViewProvider implements vscode.WebviewViewProvider {
                     }
 
                     const finalText = flattenForTerminal(applyAnswers(st.src, st.analysis, answers, object));
-                    await deliverToIris(st.session, st.terminalName, st.prefix + finalText, st.run, closeFillIn);
+                    await deliverToIris(session, st.terminalName, st.prefix + finalText, st.run, closeFillIn);
                 } finally {
                     fillInBusy = false;
                 }
@@ -714,12 +934,29 @@ function fillInHtml(nonce: string, cspSource: string): string {
     select:focus { outline: 1px solid var(--vscode-focusBorder); }
     .types { margin-top: 6px; font-size: 11px; opacity: .65; font-family: var(--vscode-editor-font-family, monospace); }
     .empty { opacity: .6; font-size: 12px; }
+    .headrow { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
+    .headrow .head { flex: 1; margin-bottom: 0; }
+    button.small { font-size: 11px; padding: 1px 8px; }
+    .killmark { text-decoration: underline dotted var(--vscode-editorWarning-foreground, #cca700); text-decoration-thickness: 1px; text-underline-offset: 3px; }
+    input.killin { border-bottom-style: dotted; border-bottom-color: var(--vscode-editorWarning-foreground, #cca700); }
+    .killnote { font-size: 12px; opacity: .8; }
+    .killnote code { font-family: var(--vscode-editor-font-family, monospace); }
+    .note { font-size: 12px; margin-top: 6px; color: var(--vscode-editorInfo-foreground, var(--vscode-foreground)); }
+    #editor { display: block; width: 100%; box-sizing: border-box; margin: 0; resize: vertical; min-height: 3em;
+              font-family: var(--vscode-editor-font-family, monospace); font-size: var(--vscode-editor-font-size, 13px); line-height: 1.5; tab-size: 4;
+              color: var(--vscode-input-foreground); background: var(--vscode-input-background);
+              border: 1px solid var(--vscode-input-border, var(--vscode-focusBorder)); border-radius: 3px; padding: 4px 6px; outline: none; }
+    #editor:focus { border-color: var(--vscode-focusBorder); }
 </style>
 </head>
 <body>
 <div id="idle" class="empty">Nothing to fill in.</div>
 <div id="main" hidden>
-    <div class="head" id="head"></div>
+    <div class="headrow">
+        <div class="head" id="head"></div>
+        <button id="snip" class="small secondary" title="Keep this code (variables left as they are) to run again with IRIS: Run Snippet">Save as snippet</button>
+        <button id="edit" class="small secondary" title="Edit the code itself">&#9998; Edit</button>
+    </div>
     <div class="objrow" id="objrow" hidden>
         <span>Object for <code id="objfor"></code>:</span>
         <select id="objmode" aria-label="How to get the object">
@@ -731,12 +968,15 @@ function fillInHtml(nonce: string, cspSource: string): string {
         <input id="objval" type="text" spellcheck="false" autocomplete="off">
         <span class="static" id="objpost"></span>
     </div>
-    <div class="peek"><pre id="code"></pre></div>
+    <div class="peek"><pre id="code"></pre><textarea id="editor" spellcheck="false" autocomplete="off" hidden></textarea></div>
+    <div class="note" id="note" hidden></div>
     <div class="info" id="info"></div>
-    <div class="types">type: 123 &middot; "text" &middot; [1,2] &middot; {"ID":1} &middot; name &middot; .byRef &middot; empty = keep as is</div>
+    <div class="types" id="types">type: 123 &middot; "text" &middot; [1,2] &middot; {"ID":1} &middot; name &middot; .byRef &middot; empty = keep as is</div>
     <div class="bar">
         <button id="go"></button>
+        <button id="saverun" class="secondary" hidden>Save and run</button>
         <button id="cancel" class="secondary">Cancel</button>
+        <span class="killnote" id="killnote"></span>
         <span class="keys" id="keys"></span>
     </div>
 </div>
@@ -746,7 +986,16 @@ function fillInHtml(nonce: string, cspSource: string): string {
     const main = document.getElementById('main');
     const idle = document.getElementById('idle');
     const code = document.getElementById('code');
+    const editor = document.getElementById('editor');
     const info = document.getElementById('info');
+    const note = document.getElementById('note');
+    const types = document.getElementById('types');
+    const killnote = document.getElementById('killnote');
+    const editBtn = document.getElementById('edit');
+    const snipBtn = document.getElementById('snip');
+    const goBtn = document.getElementById('go');
+    const saveRunBtn = document.getElementById('saverun');
+    const keys = document.getElementById('keys');
     const objrow = document.getElementById('objrow');
     const objmode = document.getElementById('objmode');
     const objval = document.getElementById('objval');
@@ -755,6 +1004,17 @@ function fillInHtml(nonce: string, cspSource: string): string {
     let firsts = [];
     let hints = {};
     let infoText = {};
+    let runLabel = 'Run';
+    // kills on globals: the ones written in the code (their text follows what is typed), the ones inside the called method
+    let parts = [];          // { part, el } in order; el = the input for a variable piece
+    let codeKills = [];
+    let bodyKills = [];
+    // edit mode
+    let editing = false;
+    let editOriginal = '';
+    let editKills = [];
+    let editTimer = 0;
+    let editOnly = false;    // editing a saved snippet: Save / Save and run, no fields, nothing runs from here
 
     function size(inp) {
         inp.style.width = (Math.max(inp.value.length, inp.placeholder.length, 1) + 1) + 'ch';
@@ -772,12 +1032,62 @@ function fillInHtml(nonce: string, cspSource: string): string {
             info.appendChild(t);
         }
     }
-    function submit() {
+    function currentValues() {
         const values = {};
         for (const key of Object.keys(byKey)) values[key] = byKey[key][0].value;
-        const msg = { type: 'submit', values };
-        if (objectData) msg.object = { mode: objmode.value, value: objmode.value === 'new' ? '' : objval.value };
+        return values;
+    }
+    function currentObject() {
+        return objectData ? { mode: objmode.value, value: objmode.value === 'new' ? '' : objval.value } : undefined;
+    }
+    function saveSnippet(run) {
+        vscode.postMessage({ type: 'snippetSave', text: editor.value, run: !!run });
+    }
+    function submit() {
+        if (editOnly) { saveSnippet(false); return; }
+        if (editing) { runEdited(); return; }
+        const msg = { type: 'submit', values: currentValues() };
+        const obj = currentObject();
+        if (obj) msg.object = obj;
         vscode.postMessage(msg);
+    }
+
+    // ---- "Running will kill ..." next to the buttons ----
+    function liveKillText(i) {
+        let t = '';
+        for (const p of parts) {
+            if (p.part.kill !== i) continue;
+            t += p.el ? (p.el.value.trim() || p.el.placeholder) : p.part.lit;
+        }
+        return t;
+    }
+    function killLabel(k, text) {
+        if (k.indirect) return ['an indirect reference (', text, ')'];
+        if (k.whole) return ['the whole global ', text, ''];
+        return ['', text, ''];
+    }
+    function updateKillNote() {
+        const items = [];
+        if (editing) editKills.forEach(k => items.push(killLabel(k, k.text)));
+        else codeKills.forEach((k, i) => items.push(killLabel(k, liveKillText(i))));
+        bodyKills.forEach(k => {
+            const l = killLabel(k, k.text);
+            if (k.where) l[2] += ' (in ' + k.where + ')';
+            items.push(l);
+        });
+        killnote.textContent = '';
+        if (items.length === 0) return;
+        killnote.appendChild(document.createTextNode('Running will kill '));
+        const shown = items.slice(0, 3);
+        shown.forEach((l, i) => {
+            if (i > 0) killnote.appendChild(document.createTextNode(', '));
+            if (l[0]) killnote.appendChild(document.createTextNode(l[0]));
+            const c = document.createElement('code');
+            c.textContent = l[1];
+            killnote.appendChild(c);
+            if (l[2]) killnote.appendChild(document.createTextNode(l[2]));
+        });
+        if (items.length > shown.length) killnote.appendChild(document.createTextNode(' and ' + (items.length - shown.length) + ' more'));
     }
 
     // ---- the "Object for ..." row (only when the code uses ..Method( / ..Property / $this on an instance) ----
@@ -798,16 +1108,16 @@ function fillInHtml(nonce: string, cspSource: string): string {
         const many = d.count > 1;
         if (mode === 'var') {
             const v = objval.value.trim() || 'obj';
-            t.textContent = 'Uses the object in ' + v + ':  ' + v + '.\u2026' + '   (type the variable that holds the object)';
+            t.textContent = 'Uses the object in ' + v + ':  ' + v + '.…' + '   (type the variable that holds the object)';
         } else if (mode === 'new') {
             t.textContent = many
-                ? 'Created once: set obj=##class(' + d.className + ').%New()  \u2014 then obj.\u2026 (used ' + d.count + '\u00d7)'
-                : '##class(' + d.className + ').%New().\u2026';
+                ? 'Created once: set obj=##class(' + d.className + ').%New()  — then obj.… (used ' + d.count + '×)'
+                : '##class(' + d.className + ').%New().…';
         } else {
-            const id = objval.value.trim() || '\u2026';
+            const id = objval.value.trim() || '…';
             t.textContent = many
-                ? 'Opened once: set obj=##class(' + d.className + ').%OpenId(' + id + ')  \u2014 then obj.\u2026 (used ' + d.count + '\u00d7)'
-                : '##class(' + d.className + ').%OpenId(' + id + ').\u2026';
+                ? 'Opened once: set obj=##class(' + d.className + ').%OpenId(' + id + ')  — then obj.… (used ' + d.count + '×)'
+                : '##class(' + d.className + ').%OpenId(' + id + ').…';
         }
         info.appendChild(t);
     }
@@ -824,6 +1134,7 @@ function fillInHtml(nonce: string, cspSource: string): string {
         for (const el of [objmode, objval]) {
             el.addEventListener('focus', () => { if (el === objval) objval.select(); showObjInfo(); });
             el.addEventListener('keydown', (e) => {
+                if (e.ctrlKey || e.metaKey) return;              // Ctrl+Enter: handled for the whole view below
                 const list = objFocusables();
                 const i = list.indexOf(el);
                 if (e.key === 'Enter') {
@@ -840,25 +1151,110 @@ function fillInHtml(nonce: string, cspSource: string): string {
     }
     bindObjectRow();
 
+    function keysText() {
+        if (editOnly) return 'Enter: new line \\u00b7 Ctrl+S / Ctrl+Enter: save \\u00b7 Esc: cancel';
+        if (editing) return 'Enter: new line \\u00b7 Ctrl+Enter: ' + runLabel.toLowerCase() + ' \\u00b7 Esc: back to the fields (drops the edits)';
+        if (firsts.length === 0 && !objectData) return 'Enter / Ctrl+Enter: ' + runLabel.toLowerCase() + ' \\u00b7 Esc: cancel';
+        return 'Tab / Enter: next \\u00b7 Shift+Tab: back \\u00b7 Enter on the last: ' + runLabel.toLowerCase() + ' \\u00b7 Ctrl+Enter: ' + runLabel.toLowerCase() + ' \\u00b7 Esc: cancel';
+    }
+    function focusStart() {
+        if (objectData) { objval.hidden ? objmode.focus() : objval.focus(); showObjInfo(); }   // the object comes first
+        else if (firsts.length) firsts[0].focus();
+        else goBtn.focus();
+    }
+
+    // ---- edit mode: the code as plain text ----
+    function autosize() {
+        editor.style.height = 'auto';
+        editor.style.height = Math.min(editor.scrollHeight + 4, Math.round(window.innerHeight * 0.6)) + 'px';
+    }
+    function showEditMode(on) {
+        editing = on;
+        editor.hidden = !on;
+        code.hidden = on;
+        types.hidden = on;
+        objrow.hidden = on || !objectData;
+        info.textContent = '';
+        editBtn.innerHTML = on ? '&#9998; Done' : '&#9998; Edit';
+        editBtn.title = on ? 'Back to the fields (for the edited code)' : 'Edit the code itself';
+        keys.textContent = keysText();
+        updateKillNote();
+    }
+    function startEdit() {
+        const msg = { type: 'editStart', values: currentValues() };
+        const obj = currentObject();
+        if (obj) msg.object = obj;
+        vscode.postMessage(msg);                       // answered with 'editText'
+    }
+    function leaveEdit() {                             // Esc / Done without changes: back to the fields as they were
+        clearTimeout(editTimer);
+        if (editOnly) { vscode.postMessage({ type: 'cancel' }); return; }
+        showEditMode(false);
+        focusStart();
+    }
+    function finishEdit() {
+        if (editor.value === editOriginal) { leaveEdit(); return; }
+        vscode.postMessage({ type: 'edited', text: editor.value });   // answered with a new 'load'
+    }
+    function runEdited() {
+        if (editOnly) { saveSnippet(false); return; }
+        vscode.postMessage({ type: 'runEdited', text: editor.value });
+    }
+    editBtn.addEventListener('click', () => { if (editing) finishEdit(); else startEdit(); });
+    editor.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); e.stopPropagation(); runEdited(); return; }
+        if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); leaveEdit(); return; }
+        if ((e.key === 's' || e.key === 'S') && (e.ctrlKey || e.metaKey)) { e.preventDefault(); e.stopPropagation(); if (editOnly) saveSnippet(false); return; }
+        if (e.key === 'Tab' && !e.shiftKey) {          // a tab character, as in an editor
+            e.preventDefault();
+            const a = editor.selectionStart, z = editor.selectionEnd;
+            editor.setRangeText('\t', a, z, 'end');
+            editor.dispatchEvent(new Event('input'));
+        }
+    });
+    editor.addEventListener('input', () => {
+        autosize();
+        clearTimeout(editTimer);
+        editTimer = setTimeout(() => vscode.postMessage({ type: 'editKills', text: editor.value }), 250);
+    });
+
+    snipBtn.addEventListener('click', () => {
+        vscode.postMessage(editing ? { type: 'saveSnippet', editing: true, text: editor.value } : { type: 'saveSnippet', editing: false });
+    });
+
     function render(data) {
         code.textContent = '';
         info.textContent = '';
         byKey = {}; firsts = []; hints = {}; infoText = data.info || {};
+        parts = [];
+        codeKills = data.kills || [];
+        bodyKills = data.bodyKills || [];
+        runLabel = data.runLabel;
         objectData = data.object || null;
-        objrow.hidden = !objectData;
         if (objectData) {
             objmode.value = 'var';
             objval.value = '';
-            document.getElementById('objfor').textContent = objectData.uses.join(', ') + (objectData.count > objectData.uses.length ? ', \u2026' : '');
+            document.getElementById('objfor').textContent = objectData.uses.join(', ') + (objectData.count > objectData.uses.length ? ', …' : '');
             syncObjMode();
         }
-        document.getElementById('head').textContent = data.runLabel + ' to ' + data.terminal + ' \\u2014 fill in the variables';
-        document.getElementById('go').textContent = data.runLabel;
-        document.getElementById('keys').textContent =
-            'Tab / Enter: next \\u00b7 Shift+Tab: back \\u00b7 Enter on the last: ' + data.runLabel.toLowerCase() + ' \\u00b7 Esc: cancel';
+        goBtn.textContent = data.runLabel;
+        note.textContent = data.note || '';
+        note.hidden = !data.note;
 
         for (const p of data.parts) {
-            if (p.lit !== undefined) { code.appendChild(document.createTextNode(p.lit)); continue; }
+            if (p.lit !== undefined) {
+                if (p.kill !== undefined) {
+                    const m = document.createElement('span');
+                    m.className = 'killmark';
+                    m.title = 'kill on a global';
+                    m.textContent = p.lit;
+                    code.appendChild(m);
+                } else {
+                    code.appendChild(document.createTextNode(p.lit));
+                }
+                parts.push({ part: p, el: null });
+                continue;
+            }
             const inp = document.createElement('input');
             inp.type = 'text';
             inp.spellcheck = false;
@@ -866,6 +1262,7 @@ function fillInHtml(nonce: string, cspSource: string): string {
             inp.placeholder = p.text;
             inp.value = (data.initial && data.initial[p.key]) || '';
             inp.dataset.key = p.key;
+            if (p.kill !== undefined) inp.classList.add('killin');
             (byKey[p.key] = byKey[p.key] || []).push(inp);
             if (p.first) {
                 firsts.push(inp);
@@ -878,6 +1275,7 @@ function fillInHtml(nonce: string, cspSource: string): string {
             }
             size(inp);
             code.appendChild(inp);
+            parts.push({ part: p, el: inp });
         }
 
         for (const inp of firsts) {
@@ -886,8 +1284,10 @@ function fillInHtml(nonce: string, cspSource: string): string {
             inp.addEventListener('input', () => {
                 for (const other of byKey[key]) { other.value = inp.value; size(other); }
                 vscode.postMessage({ type: 'check', key, value: inp.value });
+                updateKillNote();
             });
             inp.addEventListener('keydown', (e) => {
+                if (e.ctrlKey || e.metaKey) return;              // Ctrl+Enter: handled for the whole view below
                 const list = objFocusables();
                 const i = list.indexOf(inp);
                 if (e.key === 'Enter') {
@@ -901,26 +1301,79 @@ function fillInHtml(nonce: string, cspSource: string): string {
             if (inp.value) vscode.postMessage({ type: 'check', key, value: inp.value });
         }
 
+        const fields = firsts.length > 0 || !!objectData;
+        editOnly = !!data.editOnly;
+        editBtn.hidden = editOnly;
+        snipBtn.hidden = editOnly;
+        saveRunBtn.hidden = !editOnly;
+        document.getElementById('head').textContent = editOnly
+            ? 'Editing snippet: ' + data.snippetName
+            : data.runLabel + ' to ' + data.terminal + (fields ? ' \\u2014 fill in the variables' : ' \\u2014 check the code');
         idle.hidden = true;
         main.hidden = false;
-        if (objectData) { objval.focus(); showObjInfo(); }   // the object comes first: type its variable (or pick %New / %OpenId)
-        else if (firsts.length) firsts[0].focus();
+        if (editOnly) {
+            goBtn.textContent = 'Save';
+            editor.value = data.editText || '';
+            editOriginal = editor.value;
+            editKills = data.kills || [];
+            codeKills = [];
+            showEditMode(true);
+            autosize();
+            editor.focus();
+            return;
+        }
+        editOriginal = '';
+        editor.value = '';
+        showEditMode(false);
+        focusStart();
     }
 
     window.addEventListener('message', (ev) => {
         const m = ev.data;
         if (!m) return;
         if (m.type === 'load') render(m);
-        else if (m.type === 'clear') { main.hidden = true; idle.hidden = false; code.textContent = ''; }
+        else if (m.type === 'clear') { main.hidden = true; idle.hidden = false; code.textContent = ''; editing = false; editOnly = false; editor.value = ''; }
         else if (m.type === 'hint') {
             hints[m.key] = m;
             for (const inp of byKey[m.key] || []) inp.classList.toggle('bad', !!m.warn);
             const a = document.activeElement;
             if (a && a.dataset && a.dataset.key === m.key) showInfo(m.key);
         }
+        else if (m.type === 'editText') {
+            editor.value = m.text;
+            editOriginal = m.text;
+            editKills = m.kills || [];
+            showEditMode(true);
+            autosize();
+            editor.focus();
+        }
+        else if (m.type === 'editKillsResult') {
+            if (!editing) return;
+            editKills = m.kills || [];
+            updateKillNote();
+        }
+        else if (m.type === 'saved') {
+            snipBtn.textContent = 'Saved \\u2713';
+            setTimeout(() => { snipBtn.textContent = 'Save as snippet'; }, 1500);
+        }
     });
 
-    document.getElementById('go').addEventListener('click', submit);
+    // Ctrl+Enter runs from anywhere in the view; Esc on a button cancels (on a field it is handled there)
+    document.addEventListener('keydown', (e) => {
+        if (main.hidden) return;
+        if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); submit(); return; }
+        if ((e.key === 's' || e.key === 'S') && (e.ctrlKey || e.metaKey) && editOnly) { e.preventDefault(); saveSnippet(false); return; }
+        if (e.key === 'Escape' && editing) { e.preventDefault(); leaveEdit(); return; }   // (in the text box it is handled there)
+        if (e.key === 'Escape') {
+            const t = e.target;
+            if (t && (t.tagName === 'INPUT' || t.tagName === 'SELECT' || t.tagName === 'TEXTAREA')) return;
+            e.preventDefault();
+            vscode.postMessage({ type: 'cancel' });
+        }
+    });
+
+    goBtn.addEventListener('click', submit);
+    saveRunBtn.addEventListener('click', () => saveSnippet(true));
     document.getElementById('cancel').addEventListener('click', () => vscode.postMessage({ type: 'cancel' }));
     vscode.postMessage({ type: 'ready' });
 })();

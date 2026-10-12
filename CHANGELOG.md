@@ -4,6 +4,42 @@ All notable changes to the "iris-terminal" extension will be documented in this 
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.2.2]
+
+- Change: after **Edit code** on a snippet, **Save** and **Cancel / Esc** go back to the Snippets tab with that snippet selected (they used to go to the editor). **Save and run** still ends in the terminal.
+
+## [0.2.1]
+
+- Fix: the Snippets tab's tab width had no effect on code indented with spaces (the usual case for server documents). Every 4 leading spaces now count as one indentation level, like a tab, and are drawn at the chosen width.
+- Change: **Tab Width** is a submenu (right-click a snippet, or the new dropdown in the Snippets tab's title bar) with 1 / 2 / 3 / 4 spaces and a check on the current one, instead of a pick list.
+
+## [0.2.0]
+
+Fill-in and snippets release (everything from 0.1.45 to 0.1.48): kills on globals shown before running, edit mode in the Fill-in tab, snippets with the Snippets tab, namespace picked when a snippet runs.
+
+
+- New: in the Snippets tab (hover and code lines) a tab is shown **1 space wide** by default, so indented code no longer wraps as much. Right-click > **Tab Width...** (or the "..." menu of the tab) switches between 1, 2, 3 and 4 spaces; setting `iris-terminal.snippets.tabSize`. Display only: the saved code keeps its tabs.
+
+## [0.1.47]
+
+- New: **Snippets tab redesigned.** Each row shows what the snippet needs (`fill in: customerId · .outSearch` / `runs as is`) and a ⚠ icon with `kills ^g(id)` when it kills a global. The arrow shows its first 5 lines of code (longer ones end with "… N more lines - open the code"). The hover shows the full code in color with Run / Edit code / Rename links.
+- New: **double-click** a snippet (two clicks within half a second) or press **Enter** to run it; **F2** renames, **Del** deletes; row icons for Run, Edit code, Rename, Delete.
+- New: **Edit code** opens the snippet in the Fill-in tab's edit mode with **Save** (Ctrl+S) and **Save and run**.
+- New: **+** in the Snippets tab (and "IRIS: Save Selection as Snippet") saves the editor's selection as a snippet directly.
+
+## [0.1.46]
+
+- New: **Snippets tab** in the bottom panel: every saved snippet, its code on hover, **▶** to run, right-click to rename / delete. ("IRIS: Run Snippet..." still works.)
+- Change: **the namespace is chosen when a snippet runs, not when it is saved.** After the terminal is chosen, a list of the server's namespaces opens with the terminal's current one first (Enter = no `zn`); another one is switched to with `zn` in the same line. The list is read once per VS Code session over a short hidden connection; a name can also be typed.
+- Change: Save as snippet only asks for a name. A namespace stored by 0.1.45 is ignored.
+
+## [0.1.45]
+
+- New: **kills on globals are shown before running.** Code with `kill` / `zkill` on a global (also inside the label / method that *Run in Terminal* calls) always opens the Fill-in tab, even with nothing to fill in. The target is marked with a light dotted underline, and a line next to Run / Cancel says `Running will kill ^g(i)` (or `the whole global ^g`), as written; values you fill in are shown. `kill @x` is listed as indirect; `^||x` is ignored.
+- New: **✎ Edit** in the Fill-in tab: edit the code itself (filled-in values already in it). Enter = new line, Run / Ctrl+Enter = run, Esc = drop the edits. ✎ Done (or Run, when the edit added a variable) goes back to the fields for the new code.
+- New: **Save as snippet** and **IRIS: Run Snippet...**: keep code with its variables (no values), optionally with a namespace; run it later on any terminal through the Fill-in tab. Rename / delete from the list.
+- New: **Ctrl+Enter** runs from anywhere in the Fill-in tab.
+
 ## [0.1.44]
 
 - New: **Run in Terminal / Send to Terminal now follow the editor's server and namespace.** A terminal of the editor's server that is already on the editor's namespace is used; otherwise a terminal of that server is switched there with `zn "NS"` in the same line; if there is no terminal for that server one is opened (on the editor's namespace, encoding remembered per server) and the code is sent once it is ready. Previously you got "no IRIS terminal is open" or the code ran in whatever namespace the terminal happened to be on.
