@@ -3,7 +3,7 @@
   "displayName": "IRIS Terminal Bridge",
   "description": "Auto-SSL Terminal Bridge for InterSystems",
   "publisher": "alonpe",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "icon": "image/icon.png",
   "engines": {
     "vscode": "^1.95.0"
@@ -121,6 +121,10 @@
       {
         "command": "iris-terminal.snippet.tabSize.4.on",
         "title": "✓ 4 spaces"
+      },
+      {
+        "command": "iris-terminal.openLastZw",
+        "title": "IRIS: Open Last zw Output in Global Viewer"
       }
     ],
     "keybindings": [
@@ -384,6 +388,11 @@
             4
           ],
           "description": "How wide one indentation level (a tab, or 4 leading spaces) is shown in the Snippets tab: the hover and the code lines. Display only: the saved code is not changed. Also set from the Tab Width menu (right-click, or the title bar of the Snippets tab)."
+        },
+        "iris-terminal.longLineLinks": {
+          "type": "boolean",
+          "default": true,
+          "description": "VS Code gives no Ctrl+Click links on a terminal line longer than 2,000 characters. With this on, a long line that holds a global or variable with its value is cut into pieces exactly where the terminal wraps it (it looks the same), so Ctrl+Click works anywhere on it and opens the whole line. Copying such a line out of the terminal then has a line break every ~1,900 characters; the viewer's Copy has the exact value."
         }
       }
     },

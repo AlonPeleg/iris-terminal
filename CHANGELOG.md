@@ -4,6 +4,17 @@ All notable changes to the "iris-terminal" extension will be documented in this 
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.2.3]
+
+- New: **JSON values in the Global Viewer** open as a tree (with a **Pieces | JSON** switch per entry): Copy a value or a branch, **Copy path** (ObjectScript such as `{}.%FromJSON(^g("x")).data.ID`), filter keys and values, expand / collapse all, and **Open as JSON** (the selected branch, formatted, in a read-only JSON editor).
+- New: **Ctrl+Click any row of a zw output** (also a wrapped row of a long value) opens the whole output as one viewer entry: dynamic objects, JSON strings, local arrays (subscript levels) and an object's zw dump (sections and properties), opened on the variable of the clicked row. `w obj.%ToJSON()` output too. `zw ^global` rows still open as global captures.
+- New: **IRIS: Open Last zw Output in Global Viewer**.
+- New: **Ctrl+Click a variable or global in a command you ran** (the `USER>...` line): a variable types `zw name` at the prompt and opens the result in the viewer; a global writes only that node's value and opens it (JSON or pieces). Only at an empty prompt. The command line as a whole is no longer opened as if it were a global.
+- New: **long lines** (over 2,000 characters, where VS Code gives no links at all, e.g. a big JSON printed by `^%G` or `zw`) can be Ctrl+Clicked anywhere: a long data line is cut into pieces exactly where the terminal wraps it (it looks the same), and any piece opens the whole line. Setting `iris-terminal.longLineLinks`.
+- New: **Pin to compare** compares two trees key by key (changed / missing keys marked, *Only differences*).
+- Fix: Ctrl+Click on a global line whose value is printed as is (not as one quoted string) turned every `""` in it into `"`, so JSON with empty strings (`"className":""`) arrived broken. Only a value that is one whole quoted string (zw's `"abc""def"`) is unquoted now; anything else is kept exactly as printed.
+- Build: `media/globalViewer.html` (the viewer page source) is in the repository again; it was missing, so only the generated `src/globalViewerHtml.ts` existed. The value-tree code is one source, `src/valueTree.ts`, used by the extension and inserted into the page at build time.
+
 ## [0.2.2]
 
 - Change: after **Edit code** on a snippet, **Save** and **Cancel / Esc** go back to the Snippets tab with that snippet selected (they used to go to the editor). **Save and run** still ends in the terminal.

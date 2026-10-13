@@ -10,6 +10,9 @@ import { chooseSession } from './terminalChoice';
 import { resolveEditorServer, ObjectScriptConn } from './editorServer';
 import { NS_RE } from './patternSyntax';
 import { RunLensProvider, RUN_LENS_SELECTOR, RUN_LENS_ENABLED_KEY } from './runLens';
+import { LongLines, OutputBlock, OutputBlocks, selectPathFor } from './zwCapture';
+import { CmdToken, findCommandTokens, promptOf } from './termTokens';
+import { VNode, vtFromJson, vtFromZw, vtLineValue, vtTopNames } from './valueTree';
 import { Analysis, analyzeSelection, applyAnswers, buildFillParts, ClassContext, classifyAnswer, fillValuesToAnswers, findGlobalKills, flattenForTerminal, GlobalKill, ObjectChoice, objectExpression, parseClassContext, parseIncDefines, Slot } from './sendSelection';
 
 let viewerPanel: vscode.WebviewPanel | undefined;
@@ -19,7 +22,13 @@ let viewerPanel: vscode.WebviewPanel | undefined;
 let viewerPanelReady = false;
 // Adds that arrive before the (re)created panel is ready get queued here and flushed once it is,
 // instead of being lost to the classic "postMessage before the listener exists" race.
-let queuedViewerAdds: { server: string; global: string; value: string; time: string }[] = [];
+/** One capture for the Global Viewer: a global line (value), or a whole zw output (kind 'zw', its tree, and the
+ *  variable / node to open at). */
+interface ViewerAdd { server: string; global: string; value: string; time: string; kind?: 'zw'; tree?: VNode; selectPath?: string[] }
+let queuedViewerAdds: ViewerAdd[] = [];
+// "Open as JSON" documents: read-only (iris-json: scheme), kept in memory, the last 20.
+const jsonDocs = new Map<string, string>();
+let jsonDocSeq = 0;
 // Extension-wide handle used for globalState access from functions outside activate().
 let extContext: vscode.ExtensionContext | undefined;
 const VIEWER_STATE_KEY = 'iris-terminal.globalViewerState';
@@ -76,6 +85,9 @@ export interface IrisSession {
     context: vscode.ExtensionContext;
     passSource: 'settings' | 'secret' | 'manual' | 'none';
     reauthPromptShown: boolean; // guards against firing multiple password prompts for one failed login
+    output: OutputBlocks;       // the last command outputs, so a click on a zw output opens all of it
+    longLines: LongLines;       // lines too long for VS Code's links get a short clickable row under them
+    pendingInspect?: { cmd: string; token: CmdToken; until: number };   // a zw / w the extension typed, waiting for its output
 }
 
 // Keep track of live sessions by their owning vscode.Terminal (not by name/title,
@@ -158,7 +170,39 @@ export function activate(context: vscode.ExtensionContext) {
     // --- GLOBAL VIEWER LINK PROVIDER (only inside IRIS terminals) ---
     let linkProvider = vscode.window.registerTerminalLinkProvider({
         provideTerminalLinks: (context: vscode.TerminalLinkContext) => {
-            if (!sessions.has(context.terminal)) return [];
+            const session = sessions.get(context.terminal);
+            if (!session) return [];
+            // A piece of a long line (cut where it wraps, so VS Code asks for links at all): opens the whole line.
+            if (session.longLines.lineForRow(context.line) !== undefined) {
+                return [{
+                    startIndex: 0,
+                    length: context.line.length,
+                    tooltip: 'Ctrl+Click to view in Global Viewer',
+                    data: { longLine: context.line, terminal: context.terminal }
+                }];
+            }
+            // A command line at the prompt (USER>...): each variable and global in it is its own link, which shows
+            // its current value. The line as a whole is not a global, so it gets no whole-line link.
+            if (promptOf(context.line)) {
+                return findCommandTokens(context.line).map(tok => ({
+                    startIndex: tok.start,
+                    length: tok.length,
+                    tooltip: tok.kind === 'local'
+                        ? 'Ctrl+Click to show ' + tok.ref + ' in the Global Viewer (types zw ' + tok.ref + ' at the prompt)'
+                        : 'Ctrl+Click to show this node in the Global Viewer (writes its value at the prompt)',
+                    data: { inspect: tok, terminal: context.terminal }
+                }));
+            }
+            // Any row of a zw output (or of a JSON written with w x.%ToJSON()) opens that whole output.
+            const hit = session.output.findCaptureLine(context.line);
+            if (hit) {
+                return [{
+                    startIndex: 0,
+                    length: context.line.length,
+                    tooltip: hit.block.kind === 'zw' ? 'Ctrl+Click to open this zw output in the Global Viewer' : 'Ctrl+Click to open this JSON in the Global Viewer',
+                    data: { capture: { blockId: hit.block.id, lineIndex: hit.lineIndex }, terminal: context.terminal }
+                }];
+            }
             const line = context.line.trim();
             if (line.includes('=')) {
                 return [{
@@ -171,21 +215,31 @@ export function activate(context: vscode.ExtensionContext) {
             return [];
         },
         handleTerminalLink: (link: any) => {
-            const rawLine: string = link.data.line.trim();
-            const time = new Date().toLocaleTimeString();
-            const terminalName: string = link.data.terminal?.name || "IRIS Server";
-
-            const eqIndex = rawLine.indexOf('=');
-            let globalName = eqIndex >= 0 ? rawLine.slice(0, eqIndex).trim() : "Global Reference";
-            let valuePart = eqIndex >= 0 ? rawLine.slice(eqIndex + 1).trim() : rawLine;
-
-            // Strip a single pair of wrapping quotes, then unescape doubled quotes ("" -> ").
-            valuePart = valuePart.replace(/^"|"$/g, '').replace(/""/g, '"');
-
-            // The raw value is sent as-is; the webview splits it by whichever delimiter the
-            // user has selected (default '*'), so the choice can be changed after the fact
-            // without losing data.
-            showInWebview(terminalName, globalName, valuePart, time);
+            if (link.data.longLine !== undefined) {
+                const session = sessions.get(link.data.terminal);
+                const line = session?.longLines.lineForRow(link.data.longLine);
+                if (!session || line === undefined) {
+                    vscode.window.showInformationMessage('IRIS Terminal: that line is no longer kept (only the last 50 long lines are). Print it again and click it.');
+                    return;
+                }
+                // A line of a zw output opens the whole output; any other line opens like a clicked global line.
+                const hit = session.output.findCaptureLine(line);
+                if (hit) openCaptureInViewer(link.data.terminal, hit.block, hit.lineIndex);
+                else openLineInViewer(link.data.terminal, line);
+                return;
+            }
+            if (link.data.inspect) {
+                const session = sessions.get(link.data.terminal);
+                if (session) startInspect(session, link.data.inspect);
+                return;
+            }
+            if (link.data.capture) {
+                const session = sessions.get(link.data.terminal);
+                const block = session?.output.byId(link.data.capture.blockId);
+                if (session && block) openCaptureInViewer(link.data.terminal, block, link.data.capture.lineIndex);
+                return;
+            }
+            openLineInViewer(link.data.terminal, link.data.line);
         }
     });
 
@@ -272,6 +326,20 @@ export function activate(context: vscode.ExtensionContext) {
 
     context.subscriptions.push(disposable, linkProvider, pinListener, switchNamespaceDisposable, reconnectDisposable, clearPasswordDisposable, terminalCloseListener, viewerTabsListener);
     context.subscriptions.push(...registerSendSelectionCommands(context));
+
+    // Global Viewer > Open as JSON: read-only documents served from memory.
+    context.subscriptions.push(vscode.workspace.registerTextDocumentContentProvider('iris-json', {
+        provideTextDocumentContent: (uri: vscode.Uri) => jsonDocs.get(uri.query) ?? ''
+    }));
+    // The newest zw output of the active IRIS terminal, without clicking it (bind a key to it if you like).
+    context.subscriptions.push(vscode.commands.registerCommand('iris-terminal.openLastZw', () => {
+        const terminal = vscode.window.activeTerminal;
+        const session = terminal ? sessions.get(terminal) : undefined;
+        if (!terminal || !session) { vscode.window.showInformationMessage('IRIS Terminal: open an IRIS terminal first.'); return; }
+        const block = session.output.lastCapture();
+        if (!block) { vscode.window.showInformationMessage('IRIS Terminal: no zw output in this terminal yet. Run zw <variable>, then try again.'); return; }
+        openCaptureInViewer(terminal, block, -1);
+    }));
     context.subscriptions.push(...registerGlobalWatch(context, {
         getSslMode, getRejectUnauthorized, getPort: getTelnetPort, getSecretKey
     }));
@@ -1445,6 +1513,8 @@ function wireViewerPanel(panel: vscode.WebviewPanel) {
     panel.webview.onDidReceiveMessage(message => {
         if (message.command === 'pinTab') {
             ensureViewerTabKept(undefined);
+        } else if (message.command === 'openJson') {
+            openJsonDocument(String(message.title || ''), String(message.text || ''));
         } else if (message.command === 'moveToNewWindow') {
             vscode.commands.executeCommand('workbench.action.moveEditorToNewWindow');
         } else if (message.command === 'ready') {
@@ -1491,7 +1561,103 @@ function registerViewerPanelSerializer(context: vscode.ExtensionContext) {
     );
 }
 
+/** Ctrl+Click on a variable / global in a command line: types the command that prints it at the prompt (a local
+ *  only exists in this terminal's process, so it has to be printed here) and opens the result when it comes back.
+ *  Only at an empty prompt, so it never types into a running program or over text being typed. */
+function startInspect(session: IrisSession, tok: CmdToken) {
+    if (!session.client || !session.isAlive) { vscode.window.showWarningMessage('IRIS Terminal: this terminal is not connected.'); return; }
+    if (!session.output.atPrompt()) {
+        vscode.window.showInformationMessage('IRIS Terminal: the terminal is busy or has text typed at the prompt. Finish or clear it, then click again.');
+        return;
+    }
+    // A local: zw prints it whole (a dynamic object as JSON, an array with its subscripts, an object's properties).
+    // A global: only that node's value (never zw: a whole global can be huge).
+    const cmd = tok.kind === 'local'
+        ? 'zw ' + tok.ref
+        : 'w ' + '"' + (tok.ref + '=').replace(/"/g, '""') + '",$g(' + tok.ref + ',"<undefined>"),!';
+    session.pendingInspect = { cmd, token: tok, until: Date.now() + 20000 };
+    session.terminal?.show(true);
+    session.client.write(encodeInput(cmd + '\r', session.encoding));
+}
+
+/** The output of a command typed by startInspect has come back: open it, or say why there is nothing to open. */
+function finishInspect(session: IrisSession, closed: { cmd: string; lines: string[]; block?: OutputBlock }) {
+    const p = session.pendingInspect;
+    if (!p) return;
+    if (Date.now() > p.until) { session.pendingInspect = undefined; return; }
+    if (closed.cmd.replace(/\s+/g, ' ').trim() !== p.cmd.replace(/\s+/g, ' ').trim()) return;   // some other command
+    session.pendingInspect = undefined;
+    const terminal = session.terminal;
+    const err = closed.lines.find(l => /^<[A-Z ]+>/.test(l.trim()));
+    if (err) { vscode.window.showWarningMessage('IRIS Terminal: ' + p.token.ref + ' could not be read: ' + err.trim()); return; }
+    if (p.token.kind === 'local') {
+        if (!closed.block || !closed.lines.length) { vscode.window.showInformationMessage('IRIS Terminal: ' + p.token.ref + ' is not defined in this terminal.'); return; }
+        if (terminal) openCaptureInViewer(terminal, closed.block, 0);
+        return;
+    }
+    const text = closed.lines.join('\n');
+    const head = p.token.ref + '=';
+    if (!text.startsWith(head)) { vscode.window.showWarningMessage('IRIS Terminal: unexpected output for ' + p.token.ref + '.'); return; }
+    const value = text.slice(head.length);
+    if (value === '<undefined>') {
+        vscode.window.showInformationMessage('IRIS Terminal: ' + p.token.ref + ' has no value (it may only have nodes below it - Global Watch shows those).');
+        return;
+    }
+    // Written with w, so the value is exactly as stored (not zw's quoted form): sent as is.
+    showInWebview(terminal?.name || 'IRIS Server', p.token.ref, value, new Date().toLocaleTimeString());
+}
+
+/** A clicked terminal line "^global(subs)=value" -> a Global Viewer entry. The raw value is sent as is; the webview
+ *  splits it by whichever delimiter the user picks (default '*'), or shows it as a tree when it is JSON. */
+function openLineInViewer(terminal: vscode.Terminal | undefined, line: string) {
+    const rawLine = line.trim();
+    const eqIndex = rawLine.indexOf('=');
+    const globalName = eqIndex >= 0 ? rawLine.slice(0, eqIndex).trim() : 'Global Reference';
+    const valuePart = vtLineValue(eqIndex >= 0 ? rawLine.slice(eqIndex + 1).trim() : rawLine);
+    showInWebview(terminal?.name || 'IRIS Server', globalName, valuePart, new Date().toLocaleTimeString());
+}
+
+function longLineLinksEnabled(): boolean {
+    return vscode.workspace.getConfiguration('iris-terminal').get<boolean>('longLineLinks', true);
+}
+
 function showInWebview(server: string, global: string, value: string, time: string) {
+    showViewerEntry({ server, global, value, time });
+}
+
+/** A zw output (or a written JSON) from the terminal -> one Global Viewer entry with its tree, opened on the
+ *  variable of the clicked line (lineIndex -1: nothing in particular). */
+function openCaptureInViewer(terminal: vscode.Terminal, block: OutputBlock, lineIndex: number) {
+    const server = terminal.name || 'IRIS Server';
+    const time = new Date().toLocaleTimeString();
+    const value = (block.truncated ? '(output cut at 2 MB)\n' : '') + block.lines.join('\n');
+    if (block.kind === 'json') {
+        // w obj.%ToJSON(): the paths start at what was written (obj.data...).
+        const expr = /(?:^|\s)(?:w|write)\s+(.+?)\.%ToJSON\(\)\s*$/i.exec(block.cmd);
+        const base = expr ? expr[1] : '{}.%FromJSON(json)';
+        const json = vtFromJson(JSON.parse(block.lines.join('')), base);
+        showViewerEntry({ server, global: expr ? expr[1] : block.cmd, value, time, kind: 'zw', tree: { t: 'node', k: [[expr ? expr[1] : 'json', json]] } });
+        return;
+    }
+    const tree = vtFromZw(block.lines);
+    const names = vtTopNames(tree);
+    const title = names.length === 1 ? names[0] : block.cmd;
+    showViewerEntry({ server, global: title, value, time, kind: 'zw', tree, selectPath: lineIndex >= 0 ? selectPathFor(block, lineIndex) : undefined });
+}
+
+/** Opens text as a read-only JSON document next to the viewer (Global Viewer > Open as JSON). */
+async function openJsonDocument(title: string, text: string) {
+    const id = String(++jsonDocSeq);
+    jsonDocs.set(id, text);
+    while (jsonDocs.size > 20) jsonDocs.delete(jsonDocs.keys().next().value as string);
+    const name = (title || 'value').replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 80) || 'value';
+    const uri = vscode.Uri.from({ scheme: 'iris-json', path: '/' + name + '.json', query: id });
+    const doc = await vscode.workspace.openTextDocument(uri);
+    if (doc.languageId !== 'json') await vscode.languages.setTextDocumentLanguage(doc, 'json');
+    await vscode.window.showTextDocument(doc, { viewColumn: vscode.ViewColumn.Beside, preview: true });
+}
+
+function showViewerEntry(add: ViewerAdd) {
     if (!viewerPanel) {
         viewerPanel = createViewerPanel();
     }
@@ -1500,9 +1666,9 @@ function showInWebview(server: string, global: string, value: string, time: stri
     // and is still loading), sending 'addEntry' now would race the listener registration and the
     // message would simply be dropped — queue it instead; the 'ready' handler flushes the queue.
     if (viewerPanelReady) {
-        viewerPanel.webview.postMessage({ command: 'addEntry', server, global, value, time });
+        viewerPanel.webview.postMessage({ command: 'addEntry', ...add });
     } else {
-        queuedViewerAdds.push({ server, global, value, time });
+        queuedViewerAdds.push(add);
     }
     viewerPanel.reveal(vscode.ViewColumn.Two, true);
 }
@@ -1662,14 +1828,18 @@ function openTerminal(context: vscode.ExtensionContext, opts: {
         isAlive: false,
         context,
         passSource: opts.passSource,
-        reauthPromptShown: false
+        reauthPromptShown: false,
+        output: new OutputBlocks(),
+        longLines: new LongLines()
     };
 
     const pty: vscode.Pseudoterminal = {
         onDidWrite: writeEmitter.event,
         onDidChangeName: nameEmitter.event,
         onDidClose: closeEmitter.event,
-        open: () => { connectSession(session); },
+        open: (dims?: vscode.TerminalDimensions) => { if (dims) session.longLines.cols = dims.columns; connectSession(session); },
+        // The width is needed to cut long lines exactly where the terminal wraps them (see LongLines).
+        setDimensions: (dims: vscode.TerminalDimensions) => { session.longLines.cols = dims.columns; },
         close: () => {
             if (session.client) {
                 session.client.removeAllListeners();
@@ -1713,6 +1883,8 @@ function connectSession(session: IrisSession) {
     session.ready = false;
     session.isConnected = false;
     session.reauthPromptShown = false;
+    session.output.reset();
+    session.longLines.reset();
     // Freeze the namespace to `zn` into for this connect attempt now, before any data arrives.
     // lastKnownNS is also live-updated below as prompts stream in (for the tab title), and that
     // update can happen before this attempt gets to send its own `zn` — using a separate,
@@ -1767,7 +1939,10 @@ function connectSession(session: IrisSession) {
             // { stream: true } keeps partial multi-byte sequences that land on a chunk
             // boundary (common with Hebrew/UTF-8) until the rest of the bytes arrive.
             const str = session.decoder.decode(data, { stream: true });
-            session.writeEmitter.fire(str.replace(/\n/g, '\r\n'));
+            const shown = longLineLinksEnabled() ? session.longLines.annotate(str) : str;
+            session.writeEmitter.fire(shown.replace(/\n/g, '\r\n'));
+            const closed = session.output.feed(str);
+            if (closed && session.pendingInspect) finishInspect(session, closed);
 
             // Match a namespace prompt at the END of the chunk only, so we don't pick up
             // unrelated "WORD>" text elsewhere in the output. Namespace names may contain
