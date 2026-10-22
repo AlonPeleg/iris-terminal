@@ -1,8 +1,8 @@
-// Turns values into a tree the Global Viewer can draw: JSON (a global's value, or a dynamic object printed by zw) and
+// Turns values into a tree the Data Inspector can draw: JSON (a global's value, or a dynamic object printed by zw) and
 // whole zw outputs (local variables, local arrays, dynamic objects, the object dump zw prints for an oref).
 //
 // One source, used twice: the extension imports it (to parse a zw block from the terminal) and scripts/embed-media.js
-// transpiles it into the Global Viewer page at {{VALUE_TREE_JS}} (to show a global's JSON value), like patternSyntax.ts.
+// transpiles it into the Data Inspector page at {{VALUE_TREE_JS}} (to show a global's JSON value), like patternSyntax.ts.
 // So: no imports, nothing that needs Node or the DOM.
 
 /** A node of the tree. Kept small and plain, because the viewer saves its entries.
@@ -163,7 +163,7 @@ function vtUnquote(v: string): string | undefined {
     return v.slice(1, -1).replace(/""/g, '"');
 }
 
-/** The value of a clicked terminal line (the text after '=') as the Global Viewer keeps it: zw's quoted string
+/** The value of a clicked terminal line (the text after '=') as the Data Inspector keeps it: zw's quoted string
  *  ("abc""def") becomes its text; anything else is kept exactly as printed. Only a value that is one whole quoted
  *  string is unquoted: JSON printed as is ({"a":"","b":""}) has "" in it that must stay. */
 export function vtLineValue(value: string): string {

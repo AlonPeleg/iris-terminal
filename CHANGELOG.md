@@ -4,6 +4,19 @@ All notable changes to the "iris-terminal" extension will be documented in this 
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.2.6]
+
+- New: **Open Branch as JSON** in the Data Inspector row menu (**⋯** / right-click) on a branch: opens that branch, formatted, in a read-only JSON editor, like **Open as JSON** above the tree but for the row you clicked, whatever is selected. Not shown on a single value.
+
+## [0.2.5]
+
+- Renamed: the **Global Viewer** is now the **Data Inspector**, since it shows zw output and JSON as well as globals. Captures saved by an earlier version carry over. The command is now **IRIS: Open Last zw Output in Data Inspector** (same id, so existing keybindings keep working).
+- New: **Globals | JSON chips** above the sidebar tree replace the Tree | List switch (the flat List view is gone). Off by default, so everything shows; one at a time, like radio buttons; click the lit one to turn it off.
+- New: **row menu** in the tree (**⋯** on hover, or right-click), replacing the Copy / Copy path buttons: Copy Branch (Copy Value on a value), Copy Minified, Copy Key, Copy Path, Expand / Collapse Branch, Open Branch as Entry.
+- New: **Open Branch as Entry** adds a branch as its own entry, listed under the entry it came from - the same as zw'ing that path at the prompt, but cut from the capture you are looking at, so nothing is run again.
+- Changed: **Collapse all** above the tree keeps the top level open instead of closing everything.
+- Build: `media/globalViewer.html` is now really in the repository (0.2.3 said so, but it was never added), and `scripts/embed-media.js` inserts `src/valueTree.ts` into the page at `{{VALUE_TREE_JS}}`, so the page and the extension share one copy again. This also brings 0.2.4's `zw` expression fix into the page's copy.
+
 ## [0.2.4]
 
 - Fix: `zw` of an expression (`zw out.lifeInsuranceExemptions`, `zw obj.%Get(0)`) prints only the value, without `name=`, so the viewer showed it as "(other output)". The expression from the command is now its name, and a dynamic array / object opens as a tree with paths from it (`out.lifeInsuranceExemptions.%Get(0).ID`).

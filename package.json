@@ -3,7 +3,7 @@
   "displayName": "IRIS Terminal Bridge",
   "description": "Auto-SSL Terminal Bridge for InterSystems",
   "publisher": "alonpe",
-  "version": "0.2.4",
+  "version": "0.2.6",
   "icon": "image/icon.png",
   "engines": {
     "vscode": "^1.95.0"
@@ -124,7 +124,7 @@
       },
       {
         "command": "iris-terminal.openLastZw",
-        "title": "IRIS: Open Last zw Output in Global Viewer"
+        "title": "IRIS: Open Last zw Output in Data Inspector"
       }
     ],
     "keybindings": [

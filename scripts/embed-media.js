@@ -7,16 +7,20 @@ const fs = require('fs');
 const path = require('path');
 const root = path.join(__dirname, '..');
 
-function patternJs() {
+// A src/*.ts file with no imports, as plain JavaScript for a page (its `export`s dropped).
+function transpile(file) {
     const ts = require('typescript');
-    const src = fs.readFileSync(path.join(root, 'src', 'patternSyntax.ts'), 'utf8');
+    const src = fs.readFileSync(path.join(root, 'src', file), 'utf8');
     const js = ts.transpileModule(src, { compilerOptions: { target: ts.ScriptTarget.ES2019, module: ts.ModuleKind.ESNext } }).outputText;
-    return js.replace(/^export\s+/gm, '');
+    return js.replace(/^export\s+\{\s*\};?\s*$/gm, '').replace(/^export\s+/gm, '').trim();
 }
+function patternJs() { return transpile('patternSyntax.ts'); }
+// The Data Inspector page draws JSON / zw trees with the same code the extension uses (src/valueTree.ts).
+function valueTreeJs() { return transpile('valueTree.ts'); }
 
 const pages = [
     { html: 'globalWatch.html', out: 'globalWatchHtml.ts', name: 'GLOBAL_WATCH_HTML', inject: { '{{PATTERN_JS}}': patternJs } },
-    { html: 'globalViewer.html', out: 'globalViewerHtml.ts', name: 'GLOBAL_VIEWER_HTML' }
+    { html: 'globalViewer.html', out: 'globalViewerHtml.ts', name: 'GLOBAL_VIEWER_HTML', inject: { '{{VALUE_TREE_JS}}': valueTreeJs } }
 ];
 for (const pg of pages) {
     const src = path.join(root, 'media', pg.html);

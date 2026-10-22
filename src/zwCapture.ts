@@ -1,5 +1,5 @@
 // Keeps the last few command outputs of an IRIS terminal, so a Ctrl+Click on any row of a zw output can open the
-// whole output in the Global Viewer (a long value wraps over many terminal rows; VS Code hands the link provider one
+// whole output in the Data Inspector (a long value wraps over many terminal rows; VS Code hands the link provider one
 // row at a time, so the row alone is not enough).
 //
 // It works from what the server sends, not from the keys typed: the server echoes the command after the prompt, then

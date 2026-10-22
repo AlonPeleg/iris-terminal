@@ -16,13 +16,13 @@ import { VNode, vtFromJson, vtFromZw, vtLineValue, vtTopNames } from './valueTre
 import { Analysis, analyzeSelection, applyAnswers, buildFillParts, ClassContext, classifyAnswer, fillValuesToAnswers, findGlobalKills, flattenForTerminal, GlobalKill, ObjectChoice, objectExpression, parseClassContext, parseIncDefines, Slot } from './sendSelection';
 
 let viewerPanel: vscode.WebviewPanel | undefined;
-// True once the currently-open Global Viewer webview's script has announced itself as 'ready'
+// True once the currently-open Data Inspector webview's script has announced itself as 'ready'
 // (registered its message listener). Reset to false whenever a fresh panel is created, since a
 // brand-new webview's script hasn't run yet and would silently drop a message sent too early.
 let viewerPanelReady = false;
 // Adds that arrive before the (re)created panel is ready get queued here and flushed once it is,
 // instead of being lost to the classic "postMessage before the listener exists" race.
-/** One capture for the Global Viewer: a global line (value), or a whole zw output (kind 'zw', its tree, and the
+/** One capture for the Data Inspector: a global line (value), or a whole zw output (kind 'zw', its tree, and the
  *  variable / node to open at). */
 interface ViewerAdd { server: string; global: string; value: string; time: string; kind?: 'zw'; tree?: VNode; selectPath?: string[] }
 let queuedViewerAdds: ViewerAdd[] = [];
@@ -33,24 +33,24 @@ let jsonDocSeq = 0;
 let extContext: vscode.ExtensionContext | undefined;
 const VIEWER_STATE_KEY = 'iris-terminal.globalViewerState';
 // The webview is the source of truth for its own rich entry objects (delimiter, flipped,
-// pieceSearch, hideEmpty, ...) and view state (tree/list, selected and pinned entry, open tree nodes);
+// pieceSearch, hideEmpty, ...) and view state (Globals / JSON chip, selected and pinned entry, open tree nodes);
 // every time it persists, it also mirrors that state here via 'syncState' so a fully-closed-and-reopened
 // panel can be hydrated from something durable instead of starting empty (a webview's own
 // vscode.setState() doesn't survive the panel being disposed).
-interface ViewerState { entries: any[]; sideMode: 'tree' | 'list'; selectedId: string | null; pinnedId: string | null; open: string[] }
-const EMPTY_VIEWER_STATE: ViewerState = { entries: [], sideMode: 'tree', selectedId: null, pinnedId: null, open: [] };
+interface ViewerState { entries: any[]; kindFilter: '' | 'globals' | 'json'; selectedId: string | null; pinnedId: string | null; open: string[] }
+const EMPTY_VIEWER_STATE: ViewerState = { entries: [], kindFilter: '', selectedId: null, pinnedId: null, open: [] };
 let lastKnownViewerState: ViewerState = { ...EMPTY_VIEWER_STATE };
 function sanitizeViewerState(raw: any): ViewerState {
     const r = raw && typeof raw === 'object' ? raw : {};
     return {
         entries: Array.isArray(r.entries) ? r.entries : [],
-        sideMode: r.sideMode === 'list' ? 'list' : 'tree',
+        kindFilter: r.kindFilter === 'globals' || r.kindFilter === 'json' ? r.kindFilter : '',
         selectedId: typeof r.selectedId === 'string' ? r.selectedId : null,
         pinnedId: typeof r.pinnedId === 'string' ? r.pinnedId : null,
         open: Array.isArray(r.open) ? r.open.filter((k: any) => typeof k === 'string') : []
     };
 }
-// The terminal that was focused right when a brand-new Global Viewer panel got created — stashed so
+// The terminal that was focused right when a brand-new Data Inspector panel got created — stashed so
 // the 'ready' handler can briefly focus the panel (to make "keep editor" unambiguous) and then hand
 // focus straight back, instead of leaving it stuck on the panel.
 let pendingKeepEditorTerminal: vscode.Terminal | undefined;
@@ -177,7 +177,7 @@ export function activate(context: vscode.ExtensionContext) {
                 return [{
                     startIndex: 0,
                     length: context.line.length,
-                    tooltip: 'Ctrl+Click to view in Global Viewer',
+                    tooltip: 'Ctrl+Click to view in the Data Inspector',
                     data: { longLine: context.line, terminal: context.terminal }
                 }];
             }
@@ -188,8 +188,8 @@ export function activate(context: vscode.ExtensionContext) {
                     startIndex: tok.start,
                     length: tok.length,
                     tooltip: tok.kind === 'local'
-                        ? 'Ctrl+Click to show ' + tok.ref + ' in the Global Viewer (types zw ' + tok.ref + ' at the prompt)'
-                        : 'Ctrl+Click to show this node in the Global Viewer (writes its value at the prompt)',
+                        ? 'Ctrl+Click to show ' + tok.ref + ' in the Data Inspector (types zw ' + tok.ref + ' at the prompt)'
+                        : 'Ctrl+Click to show this node in the Data Inspector (writes its value at the prompt)',
                     data: { inspect: tok, terminal: context.terminal }
                 }));
             }
@@ -199,7 +199,7 @@ export function activate(context: vscode.ExtensionContext) {
                 return [{
                     startIndex: 0,
                     length: context.line.length,
-                    tooltip: hit.block.kind === 'zw' ? 'Ctrl+Click to open this zw output in the Global Viewer' : 'Ctrl+Click to open this JSON in the Global Viewer',
+                    tooltip: hit.block.kind === 'zw' ? 'Ctrl+Click to open this zw output in the Data Inspector' : 'Ctrl+Click to open this JSON in the Data Inspector',
                     data: { capture: { blockId: hit.block.id, lineIndex: hit.lineIndex }, terminal: context.terminal }
                 }];
             }
@@ -208,7 +208,7 @@ export function activate(context: vscode.ExtensionContext) {
                 return [{
                     startIndex: 0,
                     length: context.line.length,
-                    tooltip: 'Ctrl+Click to view in Global Viewer',
+                    tooltip: 'Ctrl+Click to view in the Data Inspector',
                     data: { line: context.line, terminal: context.terminal }
                 }];
             }
@@ -319,7 +319,7 @@ export function activate(context: vscode.ExtensionContext) {
 
     registerViewerPanelSerializer(context);
 
-    // Tracks the Global Viewer tab's real preview/pinned status (whatever the cause — our own
+    // Tracks the Data Inspector tab's real preview/pinned status (whatever the cause — our own
     // auto-keep, the manual pin button, or the user pinning it themselves via the tab's context
     // menu) so the webview can hide its pin icon once there's genuinely nothing left to pin.
     const viewerTabsListener = vscode.window.tabGroups.onDidChangeTabs(() => updateViewerPinnedState());
@@ -327,7 +327,7 @@ export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(disposable, linkProvider, pinListener, switchNamespaceDisposable, reconnectDisposable, clearPasswordDisposable, terminalCloseListener, viewerTabsListener);
     context.subscriptions.push(...registerSendSelectionCommands(context));
 
-    // Global Viewer > Open as JSON: read-only documents served from memory.
+    // Data Inspector > Open as JSON: read-only documents served from memory.
     context.subscriptions.push(vscode.workspace.registerTextDocumentContentProvider('iris-json', {
         provideTextDocumentContent: (uri: vscode.Uri) => jsonDocs.get(uri.query) ?? ''
     }));
@@ -1454,7 +1454,7 @@ function sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// Finds the Global Viewer's own tab (if it's currently open) across all tab groups/windows.
+// Finds the Data Inspector's own tab (if it's currently open) across all tab groups/windows.
 // Returns undefined if it can't be found (e.g. the panel was just disposed).
 function findViewerTab(): vscode.Tab | undefined {
     for (const group of vscode.window.tabGroups.all) {
@@ -1495,8 +1495,8 @@ async function ensureViewerTabKept(terminalToRestore: vscode.Terminal | undefine
 
 function createViewerPanel(): vscode.WebviewPanel {
     const panel = vscode.window.createWebviewPanel(
-        'globalViewer',
-        'Global Viewer',
+        'globalViewer',          // the view type stays, so a tab and saved captures from before the rename carry over
+        'Data Inspector',
         vscode.ViewColumn.Two,
         {
             enableScripts: true,
@@ -1543,7 +1543,7 @@ function wireViewerPanel(panel: vscode.WebviewPanel) {
     panel.webview.html = getWebviewContent(panel.webview.cspSource);
 }
 
-// Lets VS Code recreate the Global Viewer after the window reloads while the tab was open. The
+// Lets VS Code recreate the Data Inspector after the window reloads while the tab was open. The
 // panel is hydrated the same way a freshly-created one is (see the 'ready' handler above), from the
 // durable extension-side snapshot rather than relying on the webview's own transient state.
 function registerViewerPanelSerializer(context: vscode.ExtensionContext) {
@@ -1607,7 +1607,7 @@ function finishInspect(session: IrisSession, closed: { cmd: string; lines: strin
     showInWebview(terminal?.name || 'IRIS Server', p.token.ref, value, new Date().toLocaleTimeString());
 }
 
-/** A clicked terminal line "^global(subs)=value" -> a Global Viewer entry. The raw value is sent as is; the webview
+/** A clicked terminal line "^global(subs)=value" -> a Data Inspector entry. The raw value is sent as is; the webview
  *  splits it by whichever delimiter the user picks (default '*'), or shows it as a tree when it is JSON. */
 function openLineInViewer(terminal: vscode.Terminal | undefined, line: string) {
     const rawLine = line.trim();
@@ -1625,7 +1625,7 @@ function showInWebview(server: string, global: string, value: string, time: stri
     showViewerEntry({ server, global, value, time });
 }
 
-/** A zw output (or a written JSON) from the terminal -> one Global Viewer entry with its tree, opened on the
+/** A zw output (or a written JSON) from the terminal -> one Data Inspector entry with its tree, opened on the
  *  variable of the clicked line (lineIndex -1: nothing in particular). */
 function openCaptureInViewer(terminal: vscode.Terminal, block: OutputBlock, lineIndex: number) {
     const server = terminal.name || 'IRIS Server';
@@ -1645,7 +1645,7 @@ function openCaptureInViewer(terminal: vscode.Terminal, block: OutputBlock, line
     showViewerEntry({ server, global: title, value, time, kind: 'zw', tree, selectPath: lineIndex >= 0 ? selectPathFor(block, lineIndex) : undefined });
 }
 
-/** Opens text as a read-only JSON document next to the viewer (Global Viewer > Open as JSON). */
+/** Opens text as a read-only JSON document next to the viewer (Data Inspector > Open as JSON). */
 async function openJsonDocument(title: string, text: string) {
     const id = String(++jsonDocSeq);
     jsonDocs.set(id, text);

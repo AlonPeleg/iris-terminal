@@ -3,7 +3,7 @@
 [![VS Code Extension](https://img.shields.io/badge/Visual%20Studio%20Code-Extension-blue?logo=visual-studio-code)](https://marketplace.visualstudio.com/)
 [![InterSystems IRIS](https://img.shields.io/badge/InterSystems-IRIS%20%2F%20Cach%C3%A9-orange)](https://www.intersystems.com/)
 
-An advanced **Auto-SSL Terminal Bridge** for InterSystems IRIS and Caché. This extension replaces the standard terminal with a smart, context-aware bridge that handles Telnet/SSL handshakes, automatic authentication, and features a built-in **Global Viewer** with BiDi support.
+An advanced **Auto-SSL Terminal Bridge** for InterSystems IRIS and Caché. This extension replaces the standard terminal with a smart, context-aware bridge that handles Telnet/SSL handshakes, automatic authentication, and features a built-in **Data Inspector** (globals, zw output and JSON) with BiDi support.
 
 ---
 
@@ -15,20 +15,29 @@ An advanced **Auto-SSL Terminal Bridge** for InterSystems IRIS and Caché. This 
 * **Live Namespace Tracking**: The terminal tab dynamically renames itself based on your current `$Namespace` (e.g., `USER>`, `ENSDEMO>`).
 * **Legacy Encoding Support**: Full support for **Windows-1255** and **UTF-8**, ensuring Hebrew characters render correctly.
 
-### 🔍 Interactive Global Viewer
+### 🔍 Data Inspector (formerly Global Viewer)
 * **Terminal Link Provider**: High-speed regex detection for Global references in your terminal. `Ctrl+Click` any global line to inspect it.
-* **Sidebar + detail layout**: every global you `Ctrl+Click` is added to a sidebar with the full value and its pieces in a wide pane next to it. Switch the sidebar between **Tree** (server > global > subscripts, with expand / collapse all) and a flat **List** (newest first). Click the same global again later and it is kept as another capture, so you can compare how it changed.
+* **Sidebar + detail layout**: every global you `Ctrl+Click` is added to a sidebar tree (server > global > subscripts, with expand / collapse all) with the full value and its pieces in a wide pane next to it. Click the same global again later and it is kept as another capture, so you can compare how it changed.
+* **Globals | JSON chips** above the tree: off by default (everything shows). Click **Globals** to see only global captures or **JSON** to see only zw output, JSON values and branches; click the other to switch, or the lit one again to show everything. A global whose value is JSON counts as both. A new capture is never hidden: it turns the chips off if it would be.
 * **Pin to compare**: pin one entry, select another (or click a new global) and the two are shown side by side with the differing pieces highlighted.
 * **Piece Explorer**: Splits global data by `*` (or `^`, `|`, `~`, or any delimiter you type) into numbered pieces, with per-entry piece search, *Hide empty* and a *Copy* button per piece. Up / Down arrows move through the sidebar.
 * **BiDi / Hebrew "Flip"**: Specialized logic to handle "Visual Hebrew" (reversed text) often found in legacy Caché systems. Includes smart character swapping for parentheses and brackets.
 
-### 🌳 JSON values and zw output in the Global Viewer
+### 🌳 JSON values and zw output in the Data Inspector
 * **JSON values open as a tree.** When a global's value is a JSON object or array (`^mtempTest("repay")={"data":{...}}`), the viewer shows it as a collapsible tree instead of one long piece. A **Pieces | JSON** switch in the detail pane goes back to the piece view for that entry.
 * **zw output.** Run `zw out` (or `zw`, `zw arr`, `zwrite ...`) and **Ctrl+Click any row of its output** - also a row of a long value the terminal wrapped. The whole output opens as one entry: dynamic objects and JSON strings expanded, local arrays as subscript levels (`arr(1,"x")`), and the dump zw prints for an object reference split into its sections and properties. It opens on the variable of the row you clicked. `w obj.%ToJSON()` output works the same way. Lines of `zw ^global` keep opening as global captures.
 * **Click a name in a command you ran.** On a command line at the prompt (`USER>k outSearch  set status=$zaccessor.Customer.search(search,.outSearch)`), every variable and every global is its own Ctrl+Click link. Clicking a variable types `zw outSearch` at the prompt for you and opens the result in the viewer (dynamic object as JSON, local array as subscripts, plain value as a value); clicking a global writes just that node's value (`w "^g(1)=",$g(^g(1),"<undefined>"),!`, never the whole global) and opens it the same way, as JSON or pieces. A variable only exists in that terminal's process, which is why it is printed there. This only happens at an empty prompt - never while a program runs or over text you are typing. A property chain is clickable too: each part of `out.data.list` links the chain up to it (method calls end a chain, since zw would run them, except read-only `%Get(0)`, `%Size()` and the like). `$functions`, `##class(...)`, labels and routine references (`label^rtn`, `$$^rtn`, `do ^rtn`) are not links.
 * **Long lines.** VS Code gives no Ctrl+Click links at all on a terminal line longer than 2,000 characters. A long line that holds a global or variable with its value is therefore cut into pieces exactly where the terminal wraps it anyway - it looks the same - so Ctrl+Click works anywhere on it and opens the whole line. Copying such a line out of the terminal gets a line break every ~1,900 characters; the viewer's **Copy** has the exact value. Setting: `iris-terminal.longLineLinks`.
-* **IRIS: Open Last zw Output in Global Viewer** opens the newest zw output of the active terminal without clicking (no default key; bind one if you like).
-* In the tree: **Copy** (a value, or a branch as JSON), **Copy path** - ObjectScript that reaches that node, ready for the terminal or a Fill-in field (`out.data.%Get(0).ID`, `{}.%FromJSON(^mtempTest("repay")).data.liabilityBalance`, `arr(1,"x")`) - a filter for keys and values, expand / collapse all, and **Open as JSON**, which opens the selected branch (or all of it) formatted in a read-only JSON editor.
+* **IRIS: Open Last zw Output in Data Inspector** opens the newest zw output of the active terminal without clicking (no default key; bind one if you like).
+* **Row menu in the tree.** Hover a row and click **⋯**, or right-click the row:
+  * **Copy Branch** - the branch as formatted JSON (**Copy Value** on a single value).
+  * **Copy Minified** - the branch as one line of JSON, e.g. to paste after `set a=` at the prompt. Not shown on a value.
+  * **Copy Key** - the key as plain text: `loanPurposes`, `2` for an array item.
+  * **Copy Path** - ObjectScript that reaches that node, ready for the terminal or a Fill-in field (`out.data.%Get(0).ID`, `{}.%FromJSON(^mtempTest("repay")).data.liabilityBalance`, `arr(1,"x")`).
+  * **Expand Branch / Collapse Branch** - opens everything below the row, or closes it and everything below.
+  * **Open Branch as JSON** - opens the branch, formatted, in a read-only JSON editor (like **Open as JSON** above the tree, for this row). Not shown on a value.
+  * **Open Branch as Entry** - adds the branch to the sidebar as an entry of its own, listed under the one it came from, as if you had typed `zw schema.properties.loanPurposes` and Ctrl+Clicked it. It is cut from the capture you are looking at, so nothing is typed or read again: it works without a terminal at a prompt, after the variable is gone, and for a global's JSON value. Its name is the ObjectScript path when there is a plain one (`out.data.%Get(0)`), else the path from the entry's name (`schema.properties.loanPurposes`). Not shown on a value.
+* Above the tree: a filter for keys and values, **expand all**, **collapse all** (the top level stays open: each variable of a zw output keeps its first level showing), and **Open as JSON**, which opens the selected branch (or all of it) formatted in a read-only JSON editor.
 * **Pin to compare** works key by key for two trees: one row per key, changed and missing keys marked, *Only differences* to hide the rest.
 * The last 30 command outputs of each terminal are kept in memory for this (up to 2 MB each); an output is not sent anywhere until you click it.
 
@@ -114,7 +123,7 @@ Setting: `iris-terminal.sendSelection.lookupMacros`.
 1.  **Open Terminal**: Click the terminal icon in the Explorer title bar or right-click any folder and select **"IRIS: Open Terminal"**.
 2.  **Select Server**: Choose from your configured InterSystems servers.
 3.  **Choose Encoding**: Select between UTF-8 (Modern IRIS) or Windows-1255 (Legacy/Hebrew Caché).
-4.  **Inspect Globals**: When a global reference appears in the terminal output (e.g., `^User.Data(1)="A*B*C"`), `Ctrl+Click` it to launch the **Global Viewer** in a side pane.
+4.  **Inspect Globals**: When a global reference appears in the terminal output (e.g., `^User.Data(1)="A*B*C"`), `Ctrl+Click` it to launch the **Data Inspector** in a side pane.
 
 ---
 
