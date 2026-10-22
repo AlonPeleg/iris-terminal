@@ -33,6 +33,8 @@ const COMMANDS = new Set([
 const LABEL_COMMANDS = new Set(['d', 'do', 'g', 'goto', 'j', 'job']);
 // Words in a dynamic object / array literal that are values, not variables.
 const LITERAL_WORDS = new Set(['true', 'false', 'null']);
+// Methods that may be part of a clickable chain (zw evaluates the chain, so only ones that change nothing).
+const SAFE_CALLS = new Set(['%get', '%size', '%isdefined', '%gettypeof', '%tojson', '%classname', '%id']);
 
 const isIdStart = (c: string) => /[A-Za-z%]/.test(c);
 const isIdChar = (c: string) => /[A-Za-z0-9]/.test(c);
@@ -131,7 +133,28 @@ export function findCommandTokens(line: string): CmdToken[] {
             if (after === '^' || after === '(') isVar = false;                          // label^rtn, f(), obj.M()
             if (LITERAL_WORDS.has(word)) isVar = false;
             if (LABEL_COMMANDS.has(lastCommand) && state !== 'post' && depth === 0) isVar = false;   // do Label
-            if (isVar) out.push({ start: i, length: j - i, kind: 'local', ref: word });
+            if (isVar) {
+                out.push({ start: i, length: j - i, kind: 'local', ref: word });
+                // A property chain after it (out.data.list): each ".member" is a link of its own to the chain up to
+                // there. Method calls end the chain - zw would run them - except read-only ones of dynamic entities
+                // with literal arguments (%Get(0), %Size()).
+                let k = j;
+                while (line[k] === '.' && isIdStart(line[k + 1] || '')) {
+                    let e = k + 2;
+                    while (e < line.length && isIdChar(line[e])) e++;
+                    const member = line.slice(k + 1, e);
+                    if (line[e] === '(') {
+                        const close = closeParen(line, e);
+                        if (close < 0 || !SAFE_CALLS.has(member.toLowerCase())) break;
+                        const args = line.slice(e + 1, close - 1).replace(/"(?:[^"]|"")*"/g, '');
+                        if (!/^[\s\d.,+-]*$/.test(args)) break;
+                        e = close;
+                    }
+                    out.push({ start: k, length: e - k, kind: 'local', ref: line.slice(i, e) });
+                    k = e;
+                }
+                j = k;
+            }
             i = j; continue;
         }
 

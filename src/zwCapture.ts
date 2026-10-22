@@ -250,3 +250,19 @@ export class LongLines {
 
     reset() { this.endLine(); this.pieces = []; this.esc = ''; }
 }
+
+/** The single expression a "zw" command line writes (zw out.list -> out.list), or undefined for zw alone, several
+ *  arguments, or a plain variable / array (those print "name=value" lines themselves). */
+export function zwExpression(cmd: string): string | undefined {
+    const m = /(?:^|\s)(?:zw|zwrite)\s+(.+)$/i.exec(cmd.trim());
+    if (!m) return undefined;
+    let arg = m[1].trim(), depth = 0, q = false;
+    for (let i = 0; i < arg.length; i++) {
+        const c = arg[i];
+        if (c === '"') q = !q;
+        else if (!q && c === '(') depth++;
+        else if (!q && c === ')') depth--;
+        else if (!q && depth === 0 && (c === ',' || c === ' ')) { if (c === ',') return undefined; arg = arg.slice(0, i); break; }
+    }
+    return /^%?[A-Za-z][A-Za-z0-9]*(\(.*\))?$/.test(arg) ? undefined : arg;
+}

@@ -4,6 +4,11 @@ All notable changes to the "iris-terminal" extension will be documented in this 
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.2.4]
+
+- Fix: `zw` of an expression (`zw out.lifeInsuranceExemptions`, `zw obj.%Get(0)`) prints only the value, without `name=`, so the viewer showed it as "(other output)". The expression from the command is now its name, and a dynamic array / object opens as a tree with paths from it (`out.lifeInsuranceExemptions.%Get(0).ID`).
+- New: **property chains in a command line are clickable.** Hovering `out` links `out`; hovering `lifeInsuranceExemptions` in `out.lifeInsuranceExemptions` links the chain up to there (it types `zw out.lifeInsuranceExemptions`). Method calls end a chain, since zw would run them - except read-only ones with literal arguments: `%Get(0)`, `%Size()`, `%IsDefined("x")`, `%GetTypeOf`, `%ToJSON()`, `%ClassName()`, `%Id()`.
+
 ## [0.2.3]
 
 - New: **JSON values in the Global Viewer** open as a tree (with a **Pieces | JSON** switch per entry): Copy a value or a branch, **Copy path** (ObjectScript such as `{}.%FromJSON(^g("x")).data.ID`), filter keys and values, expand / collapse all, and **Open as JSON** (the selected branch, formatted, in a read-only JSON editor).

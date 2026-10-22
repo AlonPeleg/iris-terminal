@@ -10,7 +10,7 @@ import { chooseSession } from './terminalChoice';
 import { resolveEditorServer, ObjectScriptConn } from './editorServer';
 import { NS_RE } from './patternSyntax';
 import { RunLensProvider, RUN_LENS_SELECTOR, RUN_LENS_ENABLED_KEY } from './runLens';
-import { LongLines, OutputBlock, OutputBlocks, selectPathFor } from './zwCapture';
+import { LongLines, OutputBlock, OutputBlocks, selectPathFor, zwExpression } from './zwCapture';
 import { CmdToken, findCommandTokens, promptOf } from './termTokens';
 import { VNode, vtFromJson, vtFromZw, vtLineValue, vtTopNames } from './valueTree';
 import { Analysis, analyzeSelection, applyAnswers, buildFillParts, ClassContext, classifyAnswer, fillValuesToAnswers, findGlobalKills, flattenForTerminal, GlobalKill, ObjectChoice, objectExpression, parseClassContext, parseIncDefines, Slot } from './sendSelection';
@@ -1639,7 +1639,7 @@ function openCaptureInViewer(terminal: vscode.Terminal, block: OutputBlock, line
         showViewerEntry({ server, global: expr ? expr[1] : block.cmd, value, time, kind: 'zw', tree: { t: 'node', k: [[expr ? expr[1] : 'json', json]] } });
         return;
     }
-    const tree = vtFromZw(block.lines);
+    const tree = vtFromZw(block.lines, zwExpression(block.cmd));
     const names = vtTopNames(tree);
     const title = names.length === 1 ? names[0] : block.cmd;
     showViewerEntry({ server, global: title, value, time, kind: 'zw', tree, selectPath: lineIndex >= 0 ? selectPathFor(block, lineIndex) : undefined });

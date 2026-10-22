@@ -194,7 +194,7 @@ function vtZwValue(value: string, ref: string, budget: { n: number }): VNode {
 /** zw output (the lines after the command) -> one tree: a child per variable; local arrays become subscript levels;
  *  dynamic objects and JSON strings are expanded; an oref's dump (+--- general information --- / | name = value)
  *  is attached to that variable, a child per section. Lines that are none of these are kept under "(other output)". */
-export function vtFromZw(lines: string[]): VNode {
+export function vtFromZw(lines: string[], expr?: string): VNode {
     const root: VNode = { t: 'node', k: [] };
     const budget = { n: 0 };
     const other: string[] = [];
@@ -244,7 +244,10 @@ export function vtFromZw(lines: string[]): VNode {
             continue;
         }
 
-        const z = vtParseZwLine(line);
+        let z = vtParseZwLine(line);
+        // zw of an expression (zw out.list, zw obj.%Get(0)) prints only the value, without "name=": the expression
+        // from the command is its name. Only the first line can be that value.
+        if (!z && expr && !lastVar && !(root.k || []).length && !other.length) z = { name: expr, subs: [], value: line };
         if (!z) { other.push(line); lastVar = undefined; section = undefined; continue; }
         budget.n++;
         let node = child(root, z.name, z.name);

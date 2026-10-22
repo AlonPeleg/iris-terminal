@@ -3,7 +3,7 @@
   "displayName": "IRIS Terminal Bridge",
   "description": "Auto-SSL Terminal Bridge for InterSystems",
   "publisher": "alonpe",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "icon": "image/icon.png",
   "engines": {
     "vscode": "^1.95.0"
